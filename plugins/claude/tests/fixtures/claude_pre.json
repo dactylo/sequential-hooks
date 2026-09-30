@@ -1,0 +1,21 @@
+{
+  "session_id": "session-claude-pre",
+  "transcript_path": "/tmp/claude/transcript.jsonl",
+  "cwd": "/workspace/project",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf '%s\\n' hello",
+    "description": "Print a greeting",
+    "timeout": 120000,
+    "unknown_nested": {
+      "preserve": true,
+      "sequence": [1, "two", null]
+    }
+  },
+  "tool_use_id": "toolu_pre_001",
+  "unknown_top_level": {
+    "preserve": true
+  }
+}

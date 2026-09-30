@@ -1,0 +1,144 @@
+# ==========================================================
+# Build System
+# ==========================================================
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatchling>=1.27" ]
+
+# ==========================================================
+# Project Metadata
+# ==========================================================
+[project]
+name = "sequential-hooks"
+version = "0.1.0"
+description = "Run coding-agent hooks in order with agent-specific response handling"
+readme = "README.md"
+keywords = [ "coding-agents", "hooks", "orchestration", "sequential" ]
+license = "MIT"
+license-files = [ "LICENSE" ]
+requires-python = ">=3.13"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Typing :: Typed",
+]
+dynamic = [ "entry-points" ]
+urls.Documentation = "https://github.com/dactylo/sequential-hooks/tree/main/docs"
+urls.Homepage = "https://github.com/dactylo/sequential-hooks"
+urls.Issues = "https://github.com/dactylo/sequential-hooks/issues"
+urls.Repository = "https://github.com/dactylo/sequential-hooks"
+scripts.sequential-hooks = "sequential_hooks._cli:main"
+
+[dependency-groups]
+dev = [
+  "mdformat",
+  "mdformat-config",
+  "mdformat-frontmatter",
+  "mdformat-gfm",
+  "mdformat-pyproject",
+  "mdformat-ruff",
+  "mdformat-shfmt",
+  "pyproject-fmt",
+  "pyright",
+  "ruff",
+  "vulture",
+  { include-group = "test" },
+]
+test = [
+  "pytest",
+  "pytest-xdist>=3.2",
+]
+
+[tool.hatch]
+metadata.hooks.custom.path = "_build.py"
+build.targets.wheel.include = [ "/plugins/*/_sequential_hooks/", "/src/sequential_hooks/" ]
+build.targets.sdist.include = [ "/_build.py", "/plugins", "/src" ]
+build.targets.wheel.sources = [ "src" ]
+
+[tool.uv]
+# CI supplies the native Taplo CLI; its Python package lacks Linux/Windows ARM wheels.
+exclude-dependencies = [
+  { package = { name = "mdformat-config", version = "0.2.1" }, dependencies = [ "taplo" ] },
+]
+
+# ==========================================================
+# Ruff Configuration
+# ==========================================================
+[tool.ruff]
+target-version = "py313"
+line-length = 99
+namespace-packages = [ "plugins" ]
+format.quote-style = "single"
+format.exclude = [ "*.md" ]
+lint.select = [ "ALL" ]
+lint.ignore = [
+  "COM812", # Conflicts with the Ruff formatter
+  "CPY001", # Copyright notices are not required
+  "D203",   # Conflicts with the Google docstring convention
+  "D213",   # Conflicts with the Google docstring convention
+  "EM101",  # Exception must not use string literal
+  "EM102",  # Exception must not use f-string literal
+  "FBT001", # Boolean positional arg in function definition
+  "FBT002", # Boolean default value in function definition
+  "ISC001", # Implicit string concatenation
+  "Q000",   # Conflicts with the Ruff formatter
+  "Q001",   # Conflicts with the Ruff formatter
+  "Q002",   # Conflicts with the Ruff formatter
+  "Q003",   # Conflicts with the Ruff formatter
+  "T201",   # print() found
+  "TRY003", # Avoid specifying long messages outside exception class
+]
+# Defining-module privacy permits helper member access; Ruff enforces class boundaries.
+lint.per-file-ignores."plugins/agy/_sequential_hooks/_adapter.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_arguments.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_cli.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_containment/_windows.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_diagnostics.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_doctor/_command.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_doctor/_common.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sequential_hooks/_executor.py" = [ "SLF001" ]
+lint.per-file-ignores."{tests,plugins/*/tests}/**/*.py" = [
+  "D",       # No docstrings required in tests
+  "PLC2701", # Tests intentionally import private implementation symbols
+  "PLR2004", # Allow magic values in tests
+  "S101",    # Allow asserts in tests
+  "S603",    # Allow subprocess calls in tests
+  "S607",    # Allow partial executable paths in tests
+  "SLF001",  # Tests intentionally inspect and patch private state
+  "T201",    # Allow print output in tests
+]
+lint.pydocstyle.convention = "google"
+
+[tool.pyproject-fmt]
+max_supported_python = "3.15"
+
+# ==========================================================
+# Pyright Configuration
+# ==========================================================
+[tool.pyright]
+pythonVersion = "3.13"  # Keep in sync with tool.ruff.target-version
+typeCheckingMode = "strict"
+extraPaths = [ ".", "src" ]
+executionEnvironments = [
+  # Defining-module privacy permits helper member access; Pyright enforces class boundaries.
+  { root = "tests", reportPrivateUsage = "none" },
+  { root = "." },
+]
+
+# ==========================================================
+# Pytest Configuration
+# ==========================================================
+[tool.pytest]
+ini_options.testpaths = [ "plugins", "tests" ]
+ini_options.pythonpath = [ ".", "src" ]
+ini_options.addopts = [ "-q", "--strict-markers", "--tb=short" ]
+ini_options.markers = [ "slow: marks tests as slow (deselect with '-m \"not slow\"')" ]
+
+# ==========================================================
+# Mdformat Configuration (Requires mdformat-pyproject)
+# ==========================================================
+[tool.mdformat]
+wrap = 99  # Keep in sync with tool.ruff.line-length
+number = true

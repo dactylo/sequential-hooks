@@ -1,0 +1,2 @@
+[entry-points."sequential_hooks.hosts"]
+claude = "plugins.claude._sequential_hooks._adapter:ClaudeHost"

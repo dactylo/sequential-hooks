@@ -1,0 +1,19 @@
+{
+  "session_id": "session-codex-pre",
+  "cwd": "/workspace/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf '%s\\n' hello",
+    "description": "Print a greeting",
+    "timeout": 120000,
+    "unknown_nested": {
+      "preserve": true,
+      "sequence": [1, "two", null]
+    }
+  },
+  "tool_use_id": "call_codex_pre_001",
+  "unknown_top_level": {
+    "preserve": true
+  }
+}

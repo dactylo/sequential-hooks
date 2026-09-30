@@ -1,0 +1,27 @@
+{
+  "session_id": "session-claude-post",
+  "transcript_path": "/tmp/claude/transcript.jsonl",
+  "cwd": "/workspace/project",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf '%s\\n' hello",
+    "description": "Print a greeting",
+    "unknown_nested": {
+      "preserve": true
+    }
+  },
+  "tool_response": {
+    "stdout": "hello\\n",
+    "stderr": "",
+    "interrupted": false,
+    "unknown_nested": {
+      "preserve": true
+    }
+  },
+  "tool_use_id": "toolu_post_001",
+  "unknown_top_level": {
+    "preserve": true
+  }
+}

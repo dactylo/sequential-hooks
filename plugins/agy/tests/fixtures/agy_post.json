@@ -1,0 +1,9 @@
+{
+  "stepIdx": 8,
+  "toolResult": {
+    "status": "success",
+    "content": "example"
+  },
+  "conversationId": "conversation-456",
+  "unknownField": ["retained"]
+}

@@ -1,0 +1,2 @@
+[entry-points."sequential_hooks.hosts"]
+codex = "plugins.codex._sequential_hooks._adapter:CodexHost"

@@ -1,0 +1,2 @@
+[entry-points."sequential_hooks.hosts"]
+agy = "plugins.agy._sequential_hooks._adapter:AgyHost"
