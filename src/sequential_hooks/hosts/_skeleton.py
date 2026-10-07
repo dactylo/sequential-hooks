@@ -21,7 +21,7 @@ from sequential_hooks.hosts._contract import (
 from sequential_hooks.hosts._json import JsonProtocolError, dump_object, load_object
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
 DIAGNOSTIC_LIMIT_CHARACTERS = 1_000
 _DIAGNOSTIC_TRUNCATION_MARKER = '...[truncated]'
@@ -34,7 +34,6 @@ TERMINATION_FAILURES = frozenset({'output_limit', 'output_worker_timeout', 'time
 TRUNCATION_MARKER = '\n[truncated by sequential-hooks]'
 _UNCONTAINED_DEDUPLICATION_KEY = 'uncontained-termination'
 UNCONTAINED_WARNING = 'step ran without containment; descendant cleanup is not guaranteed'
-_INFRASTRUCTURE_FAILURES = FAILURE_KINDS
 type OutcomeKind = Literal[
     'developer',
     'failure',
@@ -44,6 +43,76 @@ type OutcomeKind = Literal[
     'plain',
     'structured',
 ]
+
+
+@dataclass(frozen=True)
+class Contribution:
+    """Carry one validated structured contribution from a child step.
+
+    Every field is optional; a host's `parse_structured` fills the fields its
+    protocol defines and leaves the rest at their defaults.
+
+    Attributes:
+        additional_context: Model-facing context to append.
+        continue_value: Explicit global continue flag, when present.
+        decision: Host-native decision value, when present.
+        decision_reason: Reason attached to `decision`, when present.
+        mutation: Replacement value for the event's mutation field.
+        mutation_present: Whether the contribution carries a mutation.
+        stop_reason: Reason attached to `continue_value` false.
+        suppress_output: Explicit output suppression flag, when present.
+        system_message: User-facing message to append.
+        terminal_sequence: Terminal control sequence, when present.
+    """
+
+    additional_context: str | None = None
+    continue_value: bool | None = None
+    decision: str | None = None
+    decision_reason: str | None = None
+    mutation: JsonValue = None
+    mutation_present: bool = False
+    stop_reason: str | None = None
+    suppress_output: bool | None = None
+    system_message: str | None = None
+    terminal_sequence: str | None = None
+
+
+@dataclass(frozen=True)
+class NativeResponse:
+    """Carry one final native response and its wrapper exit status.
+
+    Attributes:
+        stdout: Exact native response bytes.
+        exit_code: Wrapper process exit status.
+    """
+
+    stdout: bytes
+    exit_code: int = 0
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """Carry one classified child result before it changes adapter state.
+
+    Attributes:
+        kind: Classification the composer dispatches on.
+        developer_text: Text for the developer tier when `kind` is `developer`.
+        failure: Failure category when `kind` is `failure`.
+        message: Failure detail or native exit feedback.
+        plain: Native plain text when `kind` is `plain`.
+        returncode: Child status when `kind` is `ordinary_exit`.
+        structured: Validated contribution when `kind` is `structured`.
+        uncontained: Whether the failed step ran without containment.
+    """
+
+    kind: OutcomeKind
+    developer_text: str = ''
+    failure: str | None = None
+    message: str = ''
+    plain: str = ''
+    returncode: int | None = None
+    structured: Contribution | None = None
+    uncontained: bool = False
 
 
 class OutputFailureKind(StrEnum):
@@ -83,76 +152,6 @@ class AdapterOutputError(ValueError):
         """
         super().__init__(message)
         self.kind = kind
-
-
-@dataclass(frozen=True)
-class Contribution:
-    """Carry one validated structured contribution from a child step.
-
-    Every field is optional; a host's `parse_structured` fills the fields its
-    protocol defines and leaves the rest at their defaults.
-
-    Attributes:
-        additional_context: Model-facing context to append.
-        continue_value: Explicit global continue flag, when present.
-        decision: Host-native decision value, when present.
-        decision_reason: Reason attached to `decision`, when present.
-        mutation: Replacement value for the event's mutation field.
-        mutation_present: Whether the contribution carries a mutation.
-        stop_reason: Reason attached to `continue_value` false.
-        suppress_output: Explicit output suppression flag, when present.
-        system_message: User-facing message to append.
-        terminal_sequence: Terminal control sequence, when present.
-    """
-
-    additional_context: str | None = None
-    continue_value: bool | None = None
-    decision: str | None = None
-    decision_reason: str | None = None
-    mutation: JsonValue = None
-    mutation_present: bool = False
-    stop_reason: str | None = None
-    suppress_output: bool | None = None
-    system_message: str | None = None
-    terminal_sequence: str | None = None
-
-
-@dataclass(frozen=True)
-class Outcome:
-    """Carry one classified child result before it changes adapter state.
-
-    Attributes:
-        kind: Classification the composer dispatches on.
-        developer_text: Text for the developer tier when `kind` is `developer`.
-        failure: Failure category when `kind` is `failure`.
-        message: Failure detail or native exit feedback.
-        plain: Native plain text when `kind` is `plain`.
-        returncode: Child status when `kind` is `ordinary_exit`.
-        structured: Validated contribution when `kind` is `structured`.
-        uncontained: Whether the failed step ran without containment.
-    """
-
-    kind: OutcomeKind
-    developer_text: str = ''
-    failure: str | None = None
-    message: str = ''
-    plain: str = ''
-    returncode: int | None = None
-    structured: Contribution | None = None
-    uncontained: bool = False
-
-
-@dataclass(frozen=True)
-class NativeResponse:
-    """Carry one final native response and its wrapper exit status.
-
-    Attributes:
-        stdout: Exact native response bytes.
-        exit_code: Wrapper process exit status.
-    """
-
-    stdout: bytes
-    exit_code: int = 0
 
 
 @dataclass(frozen=True)
@@ -235,6 +234,19 @@ class CompositionState:
     updated_output: JsonValue = None
     updated_output_present: bool = False
     winning_reason_limit: int | None = None
+
+
+@dataclass(frozen=True)
+class _DiagnosticStep:
+    """Stand in for a step whose name was truncated for one diagnostic line."""
+
+    index: int
+    argv: tuple[str, ...]
+
+    @property
+    def name(self) -> str:
+        """Return the truncated name."""
+        return self.argv[0]
 
 
 class Composer:
@@ -399,23 +411,25 @@ class Composer:
         if value.decision is not None:
             raise RuntimeError('host accepted a decision it does not compose')
 
-    def _discard_plain(
-        self,
-        pending_diagnostics: list[tuple[Step, str]] | None = None,
-        *,
-        reason: str = 'structured output survived',
-    ) -> None:
-        """Discard pending plain output and diagnose each discarded text."""
-        state = self.state
-        if not state.plain:
-            return
-        for plain_step, text in state.plain:
-            diagnostic = self._plain_discard_diagnostic(text, reason=reason)
-            if pending_diagnostics is None:
-                self.write_diagnostic(plain_step, diagnostic)
-            else:
-                pending_diagnostics.append((plain_step, diagnostic))
-        state.plain.clear()
+    def bounded(self, contributions: Collection[str], limit: int | None = None) -> str:
+        """Bound labeled contributions under the host field cap.
+
+        Args:
+            contributions: Labeled contributions in step order.
+            limit: Explicit character budget from a fitted field, if any.
+
+        Returns:
+            Joined contributions, truncated with every label retained.
+
+        Raises:
+            AdapterOutputError: If truncation is required and the labels plus
+                the truncation marker cannot fit within the budget.
+        """
+        if limit is None:
+            limit = (
+                len('\n\n'.join(contributions)) if self.field_limit is None else self.field_limit
+            )
+        return bounded_contributions(contributions, limit)
 
     def bounded_contexts(self) -> str | None:
         """Return the model-facing contexts after shedding, if any.
@@ -550,64 +564,14 @@ class Composer:
         del text, stripped
         return Outcome('failure', failure=OutputFailureKind.MALFORMED.value, message=error)
 
-    def fit_response(
-        self,
-        owner: Contribution | None = None,
-        *,
-        minimal_reports: bool = False,
-    ) -> None:
-        """Shed monotonically until the structured response fits.
+    @property
+    def event(self) -> str:
+        """Return the validated native event.
 
-        The stages run in a fixed order: contexts, non-mandatory messages,
-        minimal reports, the winning-reason field, then the stop-reason field.
-        A field shed to its label-only minimum stays there.
-
-        Args:
-            owner: Contribution being published, when the fit follows one.
-            minimal_reports: Whether to start with mandatory reports already
-                reduced to their minimal text.
-
-        Raises:
-            AdapterOutputError: If no stage fits; `UNDELIVERABLE_MUTATION` when
-                `undeliverable_owner(owner)` holds, else `OVERSIZED`.
+        Returns:
+            Trusted event bound at construction.
         """
-        state = self.state
-        state.minimal_reports = minimal_reports
-        state.shed_contexts = False
-        state.shed_messages = False
-        state.stop_reason_limit = None
-        state.winning_reason_limit = None
-        if self._response_fits():
-            return
-        state.shed_contexts = True
-        if self._response_fits():
-            return
-        state.shed_messages = True
-        if self._response_fits():
-            return
-        if not state.minimal_reports:
-            state.minimal_reports = True
-            if self._response_fits():
-                return
-        if self._fit_labeled_field(state.decision_reasons, 'winning_reason_limit'):
-            return
-        stop_reasons = [state.stop_reason] if state.stop_reason is not None else []
-        if self._fit_labeled_field(stop_reasons, 'stop_reason_limit'):
-            return
-        kind = (
-            OutputFailureKind.UNDELIVERABLE_MUTATION
-            if owner is not None and self.undeliverable_owner(owner)
-            else OutputFailureKind.OVERSIZED
-        )
-        raise AdapterOutputError(
-            kind,
-            (
-                'mandatory decision-bearing output cannot be delivered within '
-                'the final response limit'
-                if kind is OutputFailureKind.UNDELIVERABLE_MUTATION
-                else 'structured contribution exceeds the final response limit'
-            ),
-        )
+        return self._event
 
     def failure_texts(self, category: str, message: str) -> tuple[str, str, str]:
         """Return the developer diagnostic, user report, and minimal report for a failure.
@@ -700,12 +664,13 @@ class Composer:
         try:
             dump_object(value)
             structured = self.parse_structured(value)
-        except (JsonProtocolError, UnicodeEncodeError):
-            return Outcome(
-                'failure',
-                failure=OutputFailureKind.MALFORMED.value,
-                message='structured stdout is not valid UTF-8 text',
+        except (JsonProtocolError, UnicodeEncodeError, RecursionError) as error:
+            message = (
+                'structured stdout nests too deeply'
+                if isinstance(error, RecursionError)
+                else 'structured stdout is not valid UTF-8 text'
             )
+            return Outcome('failure', failure=OutputFailureKind.MALFORMED.value, message=message)
         except AdapterOutputError as error:
             return Outcome('failure', failure=error.kind.value, message=str(error))
         return Outcome('structured', structured=structured) if value else Outcome('neutral')
@@ -724,6 +689,106 @@ class Composer:
         if result.returncode not in (None, 0):
             return Outcome('ordinary_exit', returncode=result.returncode)
         return self.classify_stdout(result.stdout)
+
+    @property
+    def should_run_steps(self) -> bool:
+        """Return whether this invocation should execute child steps.
+
+        Returns:
+            `True` for every composed invocation.
+        """
+        return True
+
+    def step_input(self) -> bytes:
+        """Return native JSON input for the next child.
+
+        Returns:
+            Original input until an accepted mutation changes its owned field.
+        """
+        return self.state.raw_input
+
+    def terminal_fallback(self, step: Step) -> bool:
+        """Apply the host's last-resort stage for a blocking native exit.
+
+        Args:
+            step: Child whose exit is being delivered.
+
+        Returns:
+            Whether the response now fits.
+        """
+        del step
+        return False
+
+    def undeliverable_owner(self, owner: Contribution) -> bool:
+        """Return whether an unfittable owner carries mandatory output.
+
+        Args:
+            owner: Contribution whose publication cannot fit.
+
+        Returns:
+            `True` when dropping the owner would run an operation without its
+            required mutation; the default checks only the mutation.
+        """
+        return owner.mutation_present
+
+    def fit_response(
+        self,
+        owner: Contribution | None = None,
+        *,
+        minimal_reports: bool = False,
+    ) -> None:
+        """Shed monotonically until the structured response fits.
+
+        The stages run in a fixed order: contexts, non-mandatory messages,
+        minimal reports, the winning-reason field, then the stop-reason field.
+        A field shed to its label-only minimum stays there.
+
+        Args:
+            owner: Contribution being published, when the fit follows one.
+            minimal_reports: Whether to start with mandatory reports already
+                reduced to their minimal text.
+
+        Raises:
+            AdapterOutputError: If no stage fits; `UNDELIVERABLE_MUTATION` when
+                `undeliverable_owner(owner)` holds, else `OVERSIZED`.
+        """
+        state = self.state
+        state.minimal_reports = minimal_reports
+        state.shed_contexts = False
+        state.shed_messages = False
+        state.stop_reason_limit = None
+        state.winning_reason_limit = None
+        if self._response_fits():
+            return
+        state.shed_contexts = True
+        if self._response_fits():
+            return
+        state.shed_messages = True
+        if self._response_fits():
+            return
+        if not state.minimal_reports:
+            state.minimal_reports = True
+            if self._response_fits():
+                return
+        if self._fit_labeled_field(state.decision_reasons, 'winning_reason_limit'):
+            return
+        stop_reasons = [state.stop_reason] if state.stop_reason is not None else []
+        if self._fit_labeled_field(stop_reasons, 'stop_reason_limit'):
+            return
+        kind = (
+            OutputFailureKind.UNDELIVERABLE_MUTATION
+            if owner is not None and self.undeliverable_owner(owner)
+            else OutputFailureKind.OVERSIZED
+        )
+        raise AdapterOutputError(
+            kind,
+            (
+                'mandatory decision-bearing output cannot be delivered within '
+                'the final response limit'
+                if kind is OutputFailureKind.UNDELIVERABLE_MUTATION
+                else 'structured contribution exceeds the final response limit'
+            ),
+        )
 
     def _fit_terminal(
         self,
@@ -760,37 +825,56 @@ class Composer:
             return
         raise failure
 
-    def step_input(self) -> bytes:
-        """Return native JSON input for the next child.
-
-        Returns:
-            Original input until an accepted mutation changes its owned field.
-        """
-        return self.state.raw_input
-
-    def terminal_fallback(self, step: Step) -> bool:
-        """Apply the host's last-resort stage for a blocking native exit.
+    def write_diagnostic(self, step: Step, message: str) -> None:
+        """Write one step diagnostic whose complete attributed line is bounded.
 
         Args:
-            step: Child whose exit is being delivered.
-
-        Returns:
-            Whether the response now fits.
+            step: Child the message belongs to.
+            message: Diagnostic text; truncated with a marker when the labeled
+                line would exceed `DIAGNOSTIC_LIMIT_CHARACTERS`.
         """
-        del step
-        return False
+        intended = f'sequential-hooks: step {step.index} ({step.name}): {message}\n'
+        if len(intended) <= DIAGNOSTIC_LIMIT_CHARACTERS:
+            self.diagnostics.write_step(step, message)
+            return
+        index = step.index
+        fixed_characters = len(f'sequential-hooks: step {index} (): \n')
+        if (
+            fixed_characters + _MINIMUM_DIAGNOSTIC_MESSAGE_CHARACTERS
+            >= DIAGNOSTIC_LIMIT_CHARACTERS
+        ):
+            index = 0
+            fixed_characters = len('sequential-hooks: step 0 (): \n')
+        name_budget = max(
+            0,
+            DIAGNOSTIC_LIMIT_CHARACTERS
+            - fixed_characters
+            - min(len(message), _MINIMUM_DIAGNOSTIC_MESSAGE_CHARACTERS),
+        )
+        safe_name = _truncate(step.name, name_budget)
+        message_budget = max(0, DIAGNOSTIC_LIMIT_CHARACTERS - fixed_characters - len(safe_name))
+        self.diagnostics.write_step(
+            _DiagnosticStep(index, (safe_name,)),
+            _truncate(message, message_budget),
+        )
 
-    def undeliverable_owner(self, owner: Contribution) -> bool:
-        """Return whether an unfittable owner carries mandatory output.
-
-        Args:
-            owner: Contribution whose publication cannot fit.
-
-        Returns:
-            `True` when dropping the owner would run an operation without its
-            required mutation; the default checks only the mutation.
-        """
-        return owner.mutation_present
+    def _discard_plain(
+        self,
+        pending_diagnostics: list[tuple[Step, str]] | None = None,
+        *,
+        reason: str = 'structured output survived',
+    ) -> None:
+        """Discard pending plain output and diagnose each discarded text."""
+        state = self.state
+        if not state.plain:
+            return
+        for plain_step, text in state.plain:
+            diagnostic = self._plain_discard_diagnostic(text, reason=reason)
+            if pending_diagnostics is None:
+                self.write_diagnostic(plain_step, diagnostic)
+            else:
+                pending_diagnostics.append((plain_step, diagnostic))
+        state.plain.clear()
 
     def _apply_failure(
         self,
@@ -832,77 +916,6 @@ class Composer:
             # mandatory report to its minimal text and keep the matrix decision.
             self.fit_response(minimal_reports=True)
         return 'continue' if should_continue else 'stop'
-
-    def bounded(self, contributions: list[str], limit: int | None = None) -> str:
-        """Bound labeled contributions under the host field cap.
-
-        Args:
-            contributions: Labeled contributions in step order.
-            limit: Explicit character budget from a fitted field, if any.
-
-        Returns:
-            Joined contributions, truncated with every label retained.
-
-        Raises:
-            AdapterOutputError: If truncation is required and the labels plus
-                the truncation marker cannot fit within the budget.
-        """
-        if limit is None:
-            limit = (
-                len('\n\n'.join(contributions)) if self.field_limit is None else self.field_limit
-            )
-        return bounded_contributions(contributions, limit)
-
-    def write_diagnostic(self, step: Step, message: str) -> None:
-        """Write one step diagnostic whose complete attributed line is bounded.
-
-        Args:
-            step: Child the message belongs to.
-            message: Diagnostic text; truncated with a marker when the labeled
-                line would exceed `DIAGNOSTIC_LIMIT_CHARACTERS`.
-        """
-        intended = f'sequential-hooks: step {step.index} ({step.name}): {message}\n'
-        if len(intended) <= DIAGNOSTIC_LIMIT_CHARACTERS:
-            self.diagnostics.write_step(step, message)
-            return
-        index = step.index
-        fixed_characters = len(f'sequential-hooks: step {index} (): \n')
-        if (
-            fixed_characters + _MINIMUM_DIAGNOSTIC_MESSAGE_CHARACTERS
-            >= DIAGNOSTIC_LIMIT_CHARACTERS
-        ):
-            index = 0
-            fixed_characters = len('sequential-hooks: step 0 (): \n')
-        name_budget = max(
-            0,
-            DIAGNOSTIC_LIMIT_CHARACTERS
-            - fixed_characters
-            - min(len(message), _MINIMUM_DIAGNOSTIC_MESSAGE_CHARACTERS),
-        )
-        safe_name = _truncate(step.name, name_budget)
-        message_budget = max(0, DIAGNOSTIC_LIMIT_CHARACTERS - fixed_characters - len(safe_name))
-        self.diagnostics.write_step(
-            _DiagnosticStep(index, (safe_name,)),
-            _truncate(message, message_budget),
-        )
-
-    @property
-    def event(self) -> str:
-        """Return the validated native event.
-
-        Returns:
-            Trusted event bound at construction.
-        """
-        return self._event
-
-    @property
-    def should_run_steps(self) -> bool:
-        """Return whether this invocation should execute child steps.
-
-        Returns:
-            `True` for every composed invocation.
-        """
-        return True
 
     def _apply_native_exit(self, step: Step, message: str) -> ChainControl:
         """Translate the host's blocking exit into terminal native feedback."""
@@ -1028,6 +1041,13 @@ class Composer:
                 self._fit_terminal(step, value)
             else:
                 self.fit_response(value)
+        except RecursionError:
+            self._restore(snapshot)
+            return self._apply_failure(
+                step,
+                OutputFailureKind.MALFORMED.value,
+                'structured stdout nests too deeply',
+            )
         except AdapterOutputError as error:
             self._restore(snapshot)
             return self._apply_failure(step, error.kind.value, str(error))
@@ -1089,19 +1109,6 @@ class Composer:
         if self.state.response_bytes is not None:
             return NativeResponse(self.state.response_bytes)
         return NativeResponse(self._plain_response(diagnose=True))
-
-
-@dataclass(frozen=True)
-class _DiagnosticStep:
-    """Stand in for a step whose name was truncated for one diagnostic line."""
-
-    index: int
-    argv: tuple[str, ...]
-
-    @property
-    def name(self) -> str:
-        """Return the truncated name."""
-        return self.argv[0]
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -1192,12 +1199,12 @@ def continue_after_failure(
     Raises:
         TypeError: If `failure` is not a matrix category.
     """
-    if failure not in _INFRASTRUCTURE_FAILURES and failure not in OutputFailureKind:
+    if failure not in FAILURE_KINDS and failure not in OutputFailureKind:
         raise TypeError('failure policy requires a matrix condition')
     if not pre_tool:
         return True
     return allow_on_failure and (
-        failure in _INFRASTRUCTURE_FAILURES
+        failure in FAILURE_KINDS
         or (failure in OutputFailureKind and failure != OutputFailureKind.UNDELIVERABLE_MUTATION)
     )
 
@@ -1310,7 +1317,7 @@ def reject_unsupported(message: str) -> NoReturn:
     raise AdapterOutputError(OutputFailureKind.UNSUPPORTED, message)
 
 
-def unsupported_fields(value: Mapping[str, object], allowed: Collection[str], label: str) -> None:
+def unsupported_fields(value: Mapping[str, object], allowed: Iterable[str], label: str) -> None:
     """Reject the first unknown field of a native object.
 
     Args:

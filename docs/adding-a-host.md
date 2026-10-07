@@ -1,6 +1,6 @@
 # Adding a host
 
-A host is a bundled plugin or an installed adapter package. `sequential-hooks` discovers hosts
+A host is a bundled plugin or an installed adapter package. sequential-hooks discovers hosts
 through the `sequential_hooks.hosts` entry-point group, selects one by the exact `--agent` name,
 and drives it through the public `sequential_hooks.hosts` contract. The built-in Claude Code,
 Codex, and Antigravity adapters use this interface too.
@@ -10,8 +10,8 @@ Codex, and Antigravity adapters use this interface too.
 A new host must expose a stable local command-hook contract, allow more than one handler for an
 event, and lack adequate native sequencing. Confirm those properties from current host
 documentation and controlled probes before writing the adapter. A third-party adapter carries its
-own evidence and its own compatibility claims; the [compatibility](compatibility.md) page records
-versions and known limits for built-in hosts. See [platforms](platforms.md) for process handling.
+own evidence and its own compatibility claims; the [compatibility](compatibility.md) page describes
+supported built-in hosts and known limits. See [platforms](platforms.md) for process handling.
 
 ## The contract
 
@@ -19,13 +19,14 @@ versions and known limits for built-in hosts. See [platforms](platforms.md) for 
 that subpackage alone, implements the types with its own classes, and never relies on a
 sequential-hooks class identity.
 
-- `HostSpec` names the host (`name`, `api_version`, `requires_event`, `events`) and provides three
+- `HostSpec` names the host (`name`, `api_version`, `requires_event`, `events`) and provides four
   operations: `adapter(event, raw_input, payload, diagnostics, allow_on_failure)`, which validates
   native input and returns a `HostAdapter` or raises `HostInputError`;
   `configuration_response(event, reason, diagnostics)`, which returns the host's fail-closed answer
   computed from the host and the event alone; and `doctor_loader()`, which returns a
-  `DoctorLoader`. `payload_event(payload)` returns the event a payload carries for hosts that do
-  not require `--event`.
+  `DoctorLoader`; and `payload_event(payload)`, which returns the event a payload carries for hosts
+  that do not require `--event`. Every host must implement `payload_event`, even when
+  `requires_event` is true; such a host may return `None` because the wrapper uses `--event`.
 - `HostAdapter` exposes `event`, `should_run_steps`, `step_input()`, `consume(step, result)`, and
   `finalize()`. `consume` returns the string `'continue'` or `'stop'`; after `'stop'` the runner
   calls `finalize()` for the terminal response.
@@ -81,8 +82,9 @@ example = "plugins.example._sequential_hooks._adapter:ExampleHost"
 The build collects these registrations and includes every plugin's runtime package. The source
 distribution also includes the plugin tests and documentation. No core code or central registration
 list needs editing. Leave `plugins/` and `plugins/example/` as namespace directories without
-`__init__.py`; the `_sequential_hooks` package keeps this project's files distinct from defsort and
-docwrap plugins installed in the same environment. Use unique test module names as shown above.
+`__init__.py`; the `_sequential_hooks` package keeps this project's files distinct from other
+projects' plugin packages installed in the same environment. Use unique test module names as shown
+above.
 
 Plugin code imports the supported `sequential_hooks.hosts` API and its own modules. The API also
 provides strict JSON decoding (`load_object`, `load_object_text`) and shared configuration helpers

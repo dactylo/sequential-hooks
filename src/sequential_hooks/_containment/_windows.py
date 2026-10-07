@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, cast
+from typing import TYPE_CHECKING, BinaryIO, Protocol, cast
 
 from sequential_hooks._cleanup import CleanupState
 from sequential_hooks._containment import (
@@ -51,12 +51,120 @@ _PopenFactory = Callable[..., subprocess.Popen[bytes]]
 _StartupInfoFactory = Callable[[tuple[int, int]], object]
 
 
+class _SetHandleInheritable(Protocol):
+    """Set whether a native handle is inherited by a child process."""
+
+    def __call__(self, handle: int, *, inheritable: bool) -> None: ...
+
+
 @dataclass
 class _ControlWriteResult:
     """Carry one detached control writer's bounded result."""
 
     _bytes_written: int = 0
     _error: OSError | None = None
+
+
+class _LauncherProtocolError(RuntimeError):
+    """Report a corrupt or invariant-failure launcher status frame."""
+
+
+@dataclass(frozen=True)
+class _ManagedResources:
+    """Carry one launcher's parent-owned descriptors and Job Object."""
+
+    _control_writer: int
+    _job_handle: int
+    _status_reader: int
+    _write_fd: Callable[[int, bytes], int]
+
+
+def _create_gate_pipes() -> tuple[int, int, int, int]:
+    """Create both anonymous pipes without leaking a partial first pair."""
+    control_reader, control_writer = os.pipe()
+    try:
+        status_reader, status_writer = os.pipe()
+    except OSError:
+        os.close(control_reader)
+        os.close(control_writer)
+        raise
+    return control_reader, control_writer, status_reader, status_writer
+
+
+def _decode_status_frame(frame: bytes) -> tuple[int, str]:
+    """Validate and decode one complete bounded launcher status frame."""
+    if len(frame) < _LAUNCHER_STATUS_HEADER_BYTES:
+        raise _LauncherProtocolError('launcher status frame is missing or truncated')
+    status = frame[0]
+    message_length = int.from_bytes(frame[1:_LAUNCHER_STATUS_HEADER_BYTES], 'little')
+    if message_length > _LAUNCHER_STATUS_LIMIT_BYTES - _LAUNCHER_STATUS_HEADER_BYTES:
+        raise _LauncherProtocolError('launcher status frame exceeds its bound')
+    if len(frame) != message_length + _LAUNCHER_STATUS_HEADER_BYTES:
+        raise _LauncherProtocolError('launcher status frame is truncated or has trailing bytes')
+    try:
+        message = frame[_LAUNCHER_STATUS_HEADER_BYTES:].decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise _LauncherProtocolError('launcher status text is not UTF-8') from error
+    return status, message
+
+
+def _deliver_control_frame(
+    ownership_transferred: threading.Event,
+    write_fd: Callable[[int, bytes], int],
+    descriptor: int,
+    frame: bytes,
+    result: _ControlWriteResult,
+) -> None:
+    """Own and deliver one control frame from a detached daemon."""
+    ownership_transferred.wait()
+    try:
+        while result._bytes_written < len(frame):
+            try:
+                written = write_fd(descriptor, frame[result._bytes_written :])
+            except OSError as error:
+                result._error = error
+                break
+            if written <= 0:
+                result._error = OSError('launcher control write made no progress')
+                break
+            result._bytes_written += written
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if result._error is None:
+                result._error = error
+
+
+def _native_handle(fd: int) -> int:
+    """Convert one C-runtime descriptor into its Windows kernel handle."""
+    msvcrt = __import__('msvcrt')
+    return int(msvcrt.get_osfhandle(fd))
+
+
+def _set_handle_inheritable(handle: int, *, inheritable: bool) -> None:
+    """Set one Windows kernel handle's temporary inheritance state."""
+    setter = cast('Callable[[int, bool], None]', vars(os)['set_handle_inheritable'])
+    setter(handle, inheritable)
+
+
+def _startup_info(handles: tuple[int, int]) -> object:
+    """Build one restricted Windows inherited-handle list."""
+    startup_info_type = vars(subprocess)['STARTUPINFO']
+    startup_info = startup_info_type()
+    startup_info.lpAttributeList = {'handle_list': list(handles)}
+    return cast('object', startup_info)
+
+
+@dataclass(frozen=True)
+class _WindowsRuntime:
+    """Inject process and descriptor operations for platform-neutral tests."""
+
+    _fd_to_handle: Callable[[int], int] = _native_handle
+    _popen_factory: _PopenFactory = subprocess.Popen
+    _set_handle_inheritable: _SetHandleInheritable = _set_handle_inheritable
+    _startup_info_factory: _StartupInfoFactory = _startup_info
+    _write_fd: Callable[[int, bytes], int] = os.write
 
 
 class _LauncherProcess:
@@ -210,20 +318,6 @@ class _LauncherProcess:
         return 0 if self._result_returncode is None else self._result_returncode
 
 
-class _LauncherProtocolError(RuntimeError):
-    """Report a corrupt or invariant-failure launcher status frame."""
-
-
-@dataclass(frozen=True)
-class _ManagedResources:
-    """Carry one launcher's parent-owned descriptors and Job Object."""
-
-    _control_writer: int
-    _job_handle: int
-    _status_reader: int
-    _write_fd: Callable[[int, bytes], int]
-
-
 class _WindowsManagedStep:
     """Own one launcher gate, optional Job Object, and parent status handle."""
 
@@ -272,13 +366,9 @@ class _WindowsManagedStep:
         self._assigned = True
 
     @property
-    def completion_failure(self) -> StepFailure | None:
-        """Return a decoded launcher-reported real-step spawn failure.
-
-        Returns:
-            Decoded spawn failure, or `None` when none is available.
-        """
-        return self._launcher_process._completion_failure
+    def _raw_process(self) -> subprocess.Popen[bytes]:
+        """Return the blocked launcher for pre-release assignment."""
+        return self._process
 
     def _release_job(self) -> None:
         """Drop a refused Job Object under the explicit uncontained override."""
@@ -343,15 +433,6 @@ class _WindowsManagedStep:
                 _LauncherProtocolError('launcher could not be reaped after termination')
             )
 
-    @property
-    def containment(self) -> ContainmentState:
-        """Return whether this launcher remains assigned to its Job Object.
-
-        Returns:
-            Current Job Object containment state.
-        """
-        return self._containment
-
     def _dispose_before_release(
         self,
         first_error: Exception | None = None,
@@ -380,15 +461,6 @@ class _WindowsManagedStep:
         cleanup.attempt(self._close_job)
         return cleanup.first_error
 
-    def abort_before_release(self) -> None:
-        """Dispose of the blocked launcher without starting the real step.
-
-        Raises:
-            Exception: If launcher or Job Object cleanup fails.
-        """
-        if error := self._dispose_before_release():
-            raise error
-
     def _dispose_setup_failure(
         self,
         first_error: Exception | None = None,
@@ -405,14 +477,32 @@ class _WindowsManagedStep:
         self._close_process_pipes(cleanup)
         return cleanup.first_error
 
+    def abort_before_release(self) -> None:
+        """Dispose of the blocked launcher without starting the real step.
+
+        Raises:
+            Exception: If launcher or Job Object cleanup fails.
+        """
+        if error := self._dispose_before_release():
+            raise error
+
     @property
-    def process(self) -> CompletionProcess:
-        """Return a completion facade exposing the exact real-step result.
+    def completion_failure(self) -> StepFailure | None:
+        """Return a decoded launcher-reported real-step spawn failure.
 
         Returns:
-            Launcher facade used to observe real-step completion.
+            Decoded spawn failure, or `None` when none is available.
         """
-        return self._launcher_process
+        return self._launcher_process._completion_failure
+
+    @property
+    def containment(self) -> ContainmentState:
+        """Return whether this launcher remains assigned to its Job Object.
+
+        Returns:
+            Current Job Object containment state.
+        """
+        return self._containment
 
     def finish(self) -> None:
         """Confirm remaining job members have exited, then close the handle.
@@ -444,9 +534,13 @@ class _WindowsManagedStep:
             self._api.generate_ctrl_break(self._process.pid)
 
     @property
-    def _raw_process(self) -> subprocess.Popen[bytes]:
-        """Return the blocked launcher for pre-release assignment."""
-        return self._process
+    def process(self) -> CompletionProcess:
+        """Return a completion facade exposing the exact real-step result.
+
+        Returns:
+            Launcher facade used to observe real-step completion.
+        """
+        return self._launcher_process
 
     def release(self) -> None:
         """Release after successful assignment or explicitly authorized uncontained fallback.
@@ -577,94 +671,6 @@ class _WindowsManagedStep:
         return True
 
 
-def _create_gate_pipes() -> tuple[int, int, int, int]:
-    """Create both anonymous pipes without leaking a partial first pair."""
-    control_reader, control_writer = os.pipe()
-    try:
-        status_reader, status_writer = os.pipe()
-    except OSError:
-        os.close(control_reader)
-        os.close(control_writer)
-        raise
-    return control_reader, control_writer, status_reader, status_writer
-
-
-def _decode_status_frame(frame: bytes) -> tuple[int, str]:
-    """Validate and decode one complete bounded launcher status frame."""
-    if len(frame) < _LAUNCHER_STATUS_HEADER_BYTES:
-        raise _LauncherProtocolError('launcher status frame is missing or truncated')
-    status = frame[0]
-    message_length = int.from_bytes(frame[1:_LAUNCHER_STATUS_HEADER_BYTES], 'little')
-    if message_length > _LAUNCHER_STATUS_LIMIT_BYTES - _LAUNCHER_STATUS_HEADER_BYTES:
-        raise _LauncherProtocolError('launcher status frame exceeds its bound')
-    if len(frame) != message_length + _LAUNCHER_STATUS_HEADER_BYTES:
-        raise _LauncherProtocolError('launcher status frame is truncated or has trailing bytes')
-    try:
-        message = frame[_LAUNCHER_STATUS_HEADER_BYTES:].decode('utf-8')
-    except UnicodeDecodeError as error:
-        raise _LauncherProtocolError('launcher status text is not UTF-8') from error
-    return status, message
-
-
-def _deliver_control_frame(
-    ownership_transferred: threading.Event,
-    write_fd: Callable[[int, bytes], int],
-    descriptor: int,
-    frame: bytes,
-    result: _ControlWriteResult,
-) -> None:
-    """Own and deliver one control frame from a detached daemon."""
-    ownership_transferred.wait()
-    try:
-        while result._bytes_written < len(frame):
-            try:
-                written = write_fd(descriptor, frame[result._bytes_written :])
-            except OSError as error:
-                result._error = error
-                break
-            if written <= 0:
-                result._error = OSError('launcher control write made no progress')
-                break
-            result._bytes_written += written
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError as error:
-            if result._error is None:
-                result._error = error
-
-
-def _native_handle(fd: int) -> int:
-    """Convert one C-runtime descriptor into its Windows kernel handle."""
-    msvcrt = __import__('msvcrt')
-    return int(msvcrt.get_osfhandle(fd))
-
-
-def _set_handle_inheritable(handle: int, *, inheritable: bool) -> None:
-    """Set one Windows kernel handle's temporary inheritance state."""
-    setter = cast('Callable[[int, bool], None]', vars(os)['set_handle_inheritable'])
-    setter(handle, inheritable)
-
-
-def _startup_info(handles: tuple[int, int]) -> object:
-    """Build one restricted Windows inherited-handle list."""
-    startup_info_type = vars(subprocess)['STARTUPINFO']
-    startup_info = startup_info_type()
-    startup_info.lpAttributeList = {'handle_list': list(handles)}
-    return cast('object', startup_info)
-
-
-@dataclass(frozen=True)
-class _WindowsRuntime:
-    """Inject process and descriptor operations for platform-neutral tests."""
-
-    _fd_to_handle: Callable[[int], int] = _native_handle
-    _popen_factory: _PopenFactory = subprocess.Popen
-    _set_handle_inheritable: Callable[..., None] = _set_handle_inheritable
-    _startup_info_factory: _StartupInfoFactory = _startup_info
-    _write_fd: Callable[[int, bytes], int] = os.write
-
-
 class WindowsBackend:
     """Create launcher-gated native-Windows managed steps."""
 
@@ -783,6 +789,7 @@ class WindowsBackend:
 
         Raises:
             ContainmentError: If direct fallback was not explicitly allowed.
+            OSError: If starting the fallback process fails.
         """
         del failed
         return self._fallback_or_raise(
@@ -806,6 +813,7 @@ class WindowsBackend:
             ContainmentError: If setup failed without an applicable override.
             _LauncherProtocolError: If launcher setup violates its protocol or
                 invariants.
+            OSError: If setup or cleanup fails outside the override boundary.
         """
         try:
             job_handle = self._api.create_kill_on_close_job()

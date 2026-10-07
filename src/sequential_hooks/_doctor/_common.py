@@ -12,16 +12,16 @@ from typing import cast
 
 from sequential_hooks._containment import probe_current_containment
 from sequential_hooks._doctor._command import is_windows_remote_executable
-from sequential_hooks._doctor._types import (
+from sequential_hooks._doctor._types import PlatformReport
+from sequential_hooks._executable import ExecutableStatus, resolve_executable
+from sequential_hooks.hosts import (
     ContractError,
     Finding,
     FindingSeverity,
+    HostSpec,
     InspectedCommand,
-    PlatformReport,
     Registration,
 )
-from sequential_hooks._executable import ExecutableStatus, resolve_executable
-from sequential_hooks.hosts import HostSpec
 
 _ALL_MATCHERS = frozenset({'', '*', '.*'})
 _MINIMUM_OUTER_TIMEOUT = 5.0
@@ -35,27 +35,6 @@ class _ExecutableEnvironment:
     _path_ext: str | None
     _path_value: str | None
     _windows: bool
-
-
-def _expected_contract_category(
-    category: ContractError,
-    *,
-    requires_event: bool,
-) -> ContractError:
-    """Prioritize the expected event-requiring host over an embedded host's event rule."""
-    if requires_event and category is ContractError.EVENT_FORBIDDEN:
-        return ContractError.WRONG_HOST
-    return category
-
-
-def _finding(
-    severity: FindingSeverity,
-    code: str,
-    message: str,
-    correction: str | None = None,
-) -> Finding:
-    """Build one bounded finding."""
-    return Finding(severity, code, message, correction)
 
 
 def _contract_finding(
@@ -78,12 +57,23 @@ def _contract_finding(
         ContractError.WRONG_EVENT: 'wrapper event does not match the registered event',
         ContractError.WRONG_HOST: 'wrapper agent does not match the configured agent',
     }
-    return _finding(
+    return Finding(
         FindingSeverity.ERROR,
         category.value,
         messages[category],
         corrections[category],
     )
+
+
+def _expected_contract_category(
+    category: ContractError,
+    *,
+    requires_event: bool,
+) -> ContractError:
+    """Prioritize the expected event-requiring host over an embedded host's event rule."""
+    if requires_event and category is ContractError.EVENT_FORBIDDEN:
+        return ContractError.WRONG_HOST
+    return category
 
 
 def _invocation_contract(
@@ -98,7 +88,7 @@ def _invocation_contract(
         findings.append(_contract_finding(ContractError.WRONG_HOST, spec, registration))
     if registration.event not in spec.events:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.ERROR,
                 'native_event_unsupported',
                 'wrapper is registered under a native event it cannot serve',
@@ -124,30 +114,28 @@ def _matcher_overlap(first: str | None, second: str | None) -> str:
     return 'possible'
 
 
-def _registration_state(spec: HostSpec, registration: Registration) -> tuple[Finding, ...]:
+def _registration_state(registration: Registration) -> tuple[Finding, ...]:
     """Analyze one registration's enabled and outer-timeout state."""
     findings: list[Finding] = []
     timeout = cast('object', registration.timeout)
     if registration.enabled is False:
         findings.append(
-            _finding(FindingSeverity.INFO, 'registration_disabled', 'registration is disabled')
+            Finding(FindingSeverity.INFO, 'registration_disabled', 'registration is disabled')
         )
-    elif registration.enabled is None:
+    elif registration.enabled is None and not any(
+        finding.code == 'enabled_unknown' for finding in registration.configuration_findings
+    ):
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.WARNING,
                 'enabled_unknown',
                 'registration enabled state cannot be inspected statically',
-                (
-                    'Reconcile disableAllHooks values in the discovered Claude settings sources.'
-                    if spec.name == 'claude'
-                    else 'Reconcile hook activation settings in the discovered sources.'
-                ),
+                'Reconcile hook activation settings in the discovered sources.',
             )
         )
     if timeout is None:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.WARNING,
                 'outer_timeout_missing',
                 'outer handler timeout is missing',
@@ -156,7 +144,7 @@ def _registration_state(spec: HostSpec, registration: Registration) -> tuple[Fin
         )
     elif not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.ERROR,
                 'outer_timeout_malformed',
                 'outer handler timeout is not a positive finite number',
@@ -165,7 +153,7 @@ def _registration_state(spec: HostSpec, registration: Registration) -> tuple[Fin
         )
     elif timeout < _MINIMUM_OUTER_TIMEOUT:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.WARNING,
                 'outer_timeout_too_small',
                 'outer handler timeout may expire before cleanup completes',
@@ -200,7 +188,7 @@ def _analyze_executable(
 ) -> Finding | None:
     """Return one executable resolution finding, if needed."""
     if environment._windows and is_windows_remote_executable(executable):
-        return _finding(
+        return Finding(
             FindingSeverity.WARNING,
             'command_uninspectable',
             'remote or device executable is not inspected statically',
@@ -215,7 +203,7 @@ def _analyze_executable(
     )
     label = 'wrapper' if wrapper else 'child'
     if resolution.status is ExecutableStatus.NOT_FOUND:
-        return _finding(
+        return Finding(
             FindingSeverity.ERROR,
             f'{label}_executable_missing',
             f'{label} executable cannot be resolved',
@@ -223,7 +211,7 @@ def _analyze_executable(
         )
     if resolution.status is ExecutableStatus.UNSUPPORTED_SHIM:
         safe_path = _safe_shim_path(resolution.resolved, wrapper=wrapper)
-        return _finding(
+        return Finding(
             FindingSeverity.ERROR,
             f'{label}_executable_unsupported',
             f'{label} executable resolves to an unsupported Windows shim at {safe_path}',
@@ -242,7 +230,7 @@ def _analyze_invocation(
     findings: list[Finding] = []
     if inspected.dynamic:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.WARNING,
                 'command_dynamic',
                 'dynamic command cannot be judged healthy statically',
@@ -259,7 +247,7 @@ def _analyze_invocation(
         return tuple(findings)
     if inspected.error is not None:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.WARNING,
                 'command_uninspectable',
                 'registration command cannot be inspected statically',
@@ -301,7 +289,7 @@ def _analyze_invocation(
             findings.append(child_finding)
     if invocation.step_timeout is None:
         findings.append(
-            _finding(
+            Finding(
                 FindingSeverity.INFO,
                 'outer_timeout_only',
                 'no internal step timeout is configured; only the outer handler timeout applies',
@@ -351,7 +339,7 @@ def analyze_registration(
         _windows=windows,
     )
     return (
-        *_registration_state(spec, registration),
+        *_registration_state(registration),
         *_analyze_invocation(
             spec,
             registration,
@@ -386,7 +374,7 @@ def analyze_registration_pairs(
             if first_inspected.invocation is not None and second_inspected.invocation is not None:
                 if first.matcher == second.matcher:
                     findings.append(
-                        _finding(
+                        Finding(
                             FindingSeverity.WARNING,
                             'duplicate_wrapper',
                             'event has repeated wrapper registrations',
@@ -395,7 +383,7 @@ def analyze_registration_pairs(
                     )
                 overlap = _matcher_overlap(first.matcher, second.matcher)
                 findings.append(
-                    _finding(
+                    Finding(
                         FindingSeverity.WARNING if overlap == 'definite' else FindingSeverity.INFO,
                         f'{overlap}_matcher_overlap',
                         f'{overlap} same-event matcher overlap',
@@ -418,7 +406,7 @@ def analyze_registration_pairs(
                 for step in wrapper.invocation.steps
             ):
                 findings.append(
-                    _finding(
+                    Finding(
                         FindingSeverity.WARNING,
                         'duplicate_child_registration',
                         'literal child duplicates a wrapper step',

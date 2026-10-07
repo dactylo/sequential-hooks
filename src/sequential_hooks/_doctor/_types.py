@@ -1,31 +1,9 @@
-"""Define the doctor report types and re-export the published record types."""
+"""Define the doctor report types."""
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from sequential_hooks.hosts import (
-    ConfigSource,
-    ContractError,
-    Finding,
-    FindingSeverity,
-    InspectedCommand,
-    LaunchSemantics,
-    Registration,
-    SourceKind,
-)
-
-__all__ = [
-    'ConfigSource',
-    'ContractError',
-    'DoctorReport',
-    'Finding',
-    'FindingSeverity',
-    'InspectedCommand',
-    'LaunchSemantics',
-    'PlatformReport',
-    'Registration',
-    'SourceKind',
-]
+from sequential_hooks.hosts import ConfigSource, Finding, Registration
 
 
 @dataclass(frozen=True)

@@ -1,13 +1,13 @@
 # Platforms
 
-`sequential-hooks` requires Python 3.13 or newer and a native CPython interpreter for the current
+sequential-hooks requires Python 3.13 or newer and a native CPython interpreter for the current
 platform. WSL is Linux. Native Windows CPython launched from Git Bash is Windows. MSYS2 and Cygwin
 interpreters are incompatible because their process and signal emulation matches neither native
 contract.
 
 Host compatibility and platform compatibility are separate. See [compatibility](compatibility.md)
-for recorded host versions and known limits. This page describes platform process handling; verify
-the host and platform combination you intend to use.
+for supported hosts and known limits. This page describes platform process handling; verify the
+host and platform combination you intend to use.
 
 ## Common process contract
 

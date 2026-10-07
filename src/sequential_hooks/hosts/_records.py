@@ -65,107 +65,6 @@ class Finding:
     correction: str | None = None
 
 
-class WrapperStep(Protocol):
-    """Describe one child command parsed from a registered wrapper command."""
-
-    @property
-    def argv(self) -> tuple[str, ...]:
-        """Return the literal executable token and arguments.
-
-        Returns:
-            Argument vector exactly as registered.
-        """
-        ...
-
-    @property
-    def index(self) -> int:
-        """Return the one-based chain position.
-
-        Returns:
-            Position starting at 1.
-        """
-        ...
-
-
-class WrapperInvocation(Protocol):
-    """Describe one statically parsed wrapper command from a registration."""
-
-    @property
-    def allow_on_failure(self) -> bool:
-        """Return whether the registration passes `--allow-on-failure`.
-
-        Returns:
-            `True` when the failure override is configured.
-        """
-        ...
-
-    @property
-    def event(self) -> str | None:
-        """Return the explicit `--event` value, if any.
-
-        Returns:
-            Event name, or `None` when the command passes no event.
-        """
-        ...
-
-    @property
-    def host(self) -> str:
-        """Return the `--agent` value.
-
-        Returns:
-            Host name exactly as registered.
-        """
-        ...
-
-    @property
-    def step_timeout(self) -> float | None:
-        """Return the `--step-timeout` value, if any.
-
-        Returns:
-            Positive finite seconds, or `None`.
-        """
-        ...
-
-    @property
-    def steps(self) -> Sequence[WrapperStep]:
-        """Return the child commands in execution order.
-
-        Returns:
-            One to three steps.
-        """
-        ...
-
-
-@dataclass(frozen=True)
-class InspectedCommand:
-    """Carry one immutable, non-executing command inspection.
-
-    Args:
-        argv: Statically decoded argument vector, when available.
-        invocation: Parsed wrapper invocation, when the command invokes the
-            wrapper and satisfies its grammar.
-        dynamic: Whether shell syntax prevents static inspection.
-        error: Bounded reason static inspection did not yield a usable command,
-            when applicable.
-        contract_error: Safely recognized wrapper contract failure, when
-            applicable.
-
-    Attributes:
-        argv: Statically decoded argument vector, when available.
-        invocation: Parsed wrapper invocation, when available.
-        dynamic: Whether shell syntax prevents static inspection.
-        error: Bounded static-inspection failure detail, when applicable.
-        contract_error: Safely recognized wrapper contract failure, when
-            applicable.
-    """
-
-    argv: tuple[str, ...] | None
-    invocation: WrapperInvocation | None
-    dynamic: bool
-    error: str | None
-    contract_error: ContractError | None = None
-
-
 class LaunchSemantics(StrEnum):
     """Classify how a host launches a registration command.
 
@@ -271,3 +170,104 @@ class Registration:
     enabled: bool | None
     type: str | None
     configuration_findings: tuple[Finding, ...] = ()
+
+
+class WrapperStep(Protocol):
+    """Describe one child command parsed from a registered wrapper command."""
+
+    @property
+    def argv(self) -> tuple[str, ...]:
+        """Return the literal executable token and arguments.
+
+        Returns:
+            Argument vector exactly as registered.
+        """
+        ...
+
+    @property
+    def index(self) -> int:
+        """Return the one-based chain position.
+
+        Returns:
+            Position starting at 1.
+        """
+        ...
+
+
+class WrapperInvocation(Protocol):
+    """Describe one statically parsed wrapper command from a registration."""
+
+    @property
+    def allow_on_failure(self) -> bool:
+        """Return whether the registration passes `--allow-on-failure`.
+
+        Returns:
+            `True` when the failure override is configured.
+        """
+        ...
+
+    @property
+    def event(self) -> str | None:
+        """Return the explicit `--event` value, if any.
+
+        Returns:
+            Event name, or `None` when the command passes no event.
+        """
+        ...
+
+    @property
+    def host(self) -> str:
+        """Return the `--agent` value.
+
+        Returns:
+            Host name exactly as registered.
+        """
+        ...
+
+    @property
+    def step_timeout(self) -> float | None:
+        """Return the `--step-timeout` value, if any.
+
+        Returns:
+            Positive finite seconds, or `None`.
+        """
+        ...
+
+    @property
+    def steps(self) -> Sequence[WrapperStep]:
+        """Return the child commands in execution order.
+
+        Returns:
+            One to three steps.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class InspectedCommand:
+    """Carry one immutable, non-executing command inspection.
+
+    Args:
+        argv: Statically decoded argument vector, when available.
+        invocation: Parsed wrapper invocation, when the command invokes the
+            wrapper and satisfies its grammar.
+        dynamic: Whether shell syntax prevents static inspection.
+        error: Bounded reason static inspection did not yield a usable command,
+            when applicable.
+        contract_error: Safely recognized wrapper contract failure, when
+            applicable.
+
+    Attributes:
+        argv: Statically decoded argument vector, when available.
+        invocation: Parsed wrapper invocation, when available.
+        dynamic: Whether shell syntax prevents static inspection.
+        error: Bounded static-inspection failure detail, when applicable.
+        contract_error: Safely recognized wrapper contract failure, when
+            applicable.
+    """
+
+    argv: tuple[str, ...] | None
+    invocation: WrapperInvocation | None
+    dynamic: bool
+    error: str | None
+    contract_error: ContractError | None = None

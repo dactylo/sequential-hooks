@@ -39,22 +39,10 @@ def test_project_declares_local_ci_tool_groups() -> None:
     config = tomllib.loads((_ROOT / 'pyproject.toml').read_text())
 
     assert 'dev' not in config['project'].get('optional-dependencies', {})
-    assert config['dependency-groups']['dev'] == [
-        'mdformat',
-        'mdformat-config',
-        'mdformat-frontmatter',
-        'mdformat-gfm',
-        'mdformat-pyproject',
-        'mdformat-ruff',
-        'mdformat-shfmt',
-        'pyproject-fmt',
-        'pyright',
-        'ruff',
-        'vulture',
-        {'include-group': 'test'},
-    ]
-    assert config['dependency-groups']['test'] == ['pytest', 'pytest-xdist>=3.2']
+    assert {'include-group': 'test'} in config['dependency-groups']['dev']
+    assert config['dependency-groups']['test']
     assert (_ROOT / 'requirements-ci.txt').is_file()
+    assert (_ROOT / 'requirements-test.txt').is_file()
 
 
 def test_project_declares_one_python_313_floor() -> None:

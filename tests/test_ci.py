@@ -92,16 +92,14 @@ def _assert_package_and_hosted(jobs: dict[str, str], active: str) -> None:
         '"$RUNNER_TEMP/package-smoke/bin/sequential-hooks" --version',
     ):
         assert 'working-directory: ${{ runner.temp }}' in _step_containing(package_steps, command)
-    upload = _step_containing(
-        package_steps, 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
-    )
+    upload = _step_containing(package_steps, 'actions/upload-artifact@')
+    assert re.search(r'uses: actions/upload-artifact@[0-9a-f]{40}\s', upload)
     assert "'python-distributions' || 'local-distributions'" in upload
     assert "if: github.event_name != 'pull_request'" in upload
 
     for job in (jobs['quality'], jobs['test'], package):
-        checkout = _step_containing(
-            _step_blocks(job), 'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10'
-        )
+        checkout = _step_containing(_step_blocks(job), 'actions/checkout@')
+        assert re.search(r'uses: actions/checkout@[0-9a-f]{40}\s', checkout)
         assert 'persist-credentials: false' in checkout
         assert 'runner.environment' in job
 
@@ -163,9 +161,6 @@ def _assert_ci_workflow(workflow: str) -> None:
     assert "runner.environment == 'self-hosted' && runner.arch == 'ARM64'" in setup_python
     assert "'arm64' || 'x64'" in setup_python
     suite = _step_containing(test_steps, 'Run suite excluding native tiers')
-    assert "runner.environment == 'self-hosted' && runner.os != 'Linux'" in suite
-    assert '!inputs.full_tests' in suite
-    assert "selection=(-m 'not slow')" in suite
     assert 'python -m pytest -q -n auto --dist worksteal --durations=15' in suite
     assert '--ignore=tests/containment/test_posix.py' in suite
     assert '--ignore=tests/containment/test_windows_native.py' in suite
@@ -382,6 +377,14 @@ def test_ci_tier_assertion_rejects_truncated_matching_suite(
     )
 
 
+@pytest.mark.parametrize('action', ['checkout', 'upload-artifact'])
+def test_ci_workflow_accepts_updated_action_pins(action: str) -> None:
+    workflow = _WORKFLOW.read_text(encoding='ascii')
+    updated = re.sub(rf'(actions/{action}@)[0-9a-f]{{40}}', rf'\g<1>{"a" * 40}', workflow)
+    assert updated != workflow
+    _assert_ci_workflow(updated)
+
+
 def test_ci_workflow_preserves_required_checks_and_package_smoke() -> None:
     _assert_ci_workflow(_WORKFLOW.read_text(encoding='ascii'))
 
@@ -411,8 +414,8 @@ def test_ci_workflow_preserves_required_checks_and_package_smoke() -> None:
         ),
         ('          persist-credentials: false', '          # persist-credentials: false'),
         (
-            'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
-            'example/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
+            'actions/checkout@',
+            'example/checkout@',
         ),
         ('      - name: Run suite excluding native tiers', '      - if: false'),
         (

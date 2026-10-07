@@ -30,6 +30,91 @@ type JsonValue = bool | int | float | str | list['JsonValue'] | dict[str, 'JsonV
 type JsonObject = dict[str, JsonValue]
 
 
+class DoctorLoader(Protocol):
+    """Inspect one host's hook configuration without executing anything."""
+
+    def analyze_registration(
+        self,
+        registration: Registration,
+        inspected: InspectedCommand,
+        *,
+        windows: bool,
+    ) -> tuple[Finding, ...]:
+        """Return host-specific findings for one inspected registration.
+
+        Args:
+            registration: Accepted registration.
+            inspected: Static inspection of the registration's command.
+            windows: Whether Windows launch semantics apply.
+
+        Returns:
+            Findings in report order; empty when the host adds none.
+        """
+        ...
+
+    def discover_sources(
+        self,
+        home: Path,
+        cwd: Path,
+        system_root: Path,
+    ) -> tuple[ConfigSource, ...]:
+        """Return every configuration source in deterministic inspection order.
+
+        Args:
+            home: Home directory used to locate user configuration.
+            cwd: Working directory used to locate project configuration.
+            system_root: Filesystem root used to locate system configuration.
+
+        Returns:
+            Candidate sources, existing or not, in inspection order.
+        """
+        ...
+
+    def inspection_limitations(self) -> tuple[str, ...]:
+        """Return configuration sources static inspection cannot establish.
+
+        Returns:
+            Stable limitation descriptions in report order.
+        """
+        ...
+
+    def load_registrations(
+        self,
+        sources: tuple[ConfigSource, ...],
+    ) -> tuple[tuple[Registration, ...], tuple[Finding, ...]]:
+        """Extract registrations and structural findings in source order.
+
+        Args:
+            sources: Sources returned by `discover_sources`.
+
+        Returns:
+            Accepted registrations and source-isolated findings.
+        """
+        ...
+
+
+class FinalResponse(Protocol):
+    """Carry the wrapper's final native response and exit status."""
+
+    @property
+    def exit_code(self) -> int:
+        """Return the wrapper process exit status.
+
+        Returns:
+            Exit status the wrapper returns after writing `stdout`.
+        """
+        ...
+
+    @property
+    def stdout(self) -> bytes:
+        """Return the exact native response bytes.
+
+        Returns:
+            Bytes written unchanged to the wrapper's standard output.
+        """
+        ...
+
+
 class HostInputError(ValueError):
     """Report an expected native-input rejection whose message is safe to surface.
 
@@ -69,6 +154,27 @@ class Step(Protocol):
 
         Returns:
             Basename, or the original token when it has no basename.
+        """
+        ...
+
+
+class Diagnostics(Protocol):
+    """Write bounded, labeled developer diagnostics."""
+
+    def write_global(self, message: str) -> None:
+        """Write a diagnostic that does not belong to one step.
+
+        Args:
+            message: Safe user-facing diagnostic text.
+        """
+        ...
+
+    def write_step(self, step: Step, message: str) -> None:
+        """Write one labeled step diagnostic.
+
+        Args:
+            step: Child associated with the message.
+            message: Safe user-facing diagnostic text.
         """
         ...
 
@@ -160,49 +266,6 @@ class StepResult(Protocol):
         ...
 
 
-class FinalResponse(Protocol):
-    """Carry the wrapper's final native response and exit status."""
-
-    @property
-    def exit_code(self) -> int:
-        """Return the wrapper process exit status.
-
-        Returns:
-            Exit status the wrapper returns after writing `stdout`.
-        """
-        ...
-
-    @property
-    def stdout(self) -> bytes:
-        """Return the exact native response bytes.
-
-        Returns:
-            Bytes written unchanged to the wrapper's standard output.
-        """
-        ...
-
-
-class Diagnostics(Protocol):
-    """Write bounded, labeled developer diagnostics."""
-
-    def write_global(self, message: str) -> None:
-        """Write a diagnostic that does not belong to one step.
-
-        Args:
-            message: Safe user-facing diagnostic text.
-        """
-        ...
-
-    def write_step(self, step: Step, message: str) -> None:
-        """Write one labeled step diagnostic.
-
-        Args:
-            step: Child associated with the message.
-            message: Safe user-facing diagnostic text.
-        """
-        ...
-
-
 class HostAdapter(Protocol):
     """Compose ordered child results for one validated native invocation.
 
@@ -257,69 +320,6 @@ class HostAdapter(Protocol):
 
         Returns:
             Current native payload as strict JSON bytes.
-        """
-        ...
-
-
-class DoctorLoader(Protocol):
-    """Inspect one host's hook configuration without executing anything."""
-
-    def analyze_registration(
-        self,
-        registration: Registration,
-        inspected: InspectedCommand,
-        *,
-        windows: bool,
-    ) -> tuple[Finding, ...]:
-        """Return host-specific findings for one inspected registration.
-
-        Args:
-            registration: Accepted registration.
-            inspected: Static inspection of the registration's command.
-            windows: Whether Windows launch semantics apply.
-
-        Returns:
-            Findings in report order; empty when the host adds none.
-        """
-        ...
-
-    def discover_sources(
-        self,
-        home: Path,
-        cwd: Path,
-        system_root: Path,
-    ) -> tuple[ConfigSource, ...]:
-        """Return every configuration source in deterministic inspection order.
-
-        Args:
-            home: Home directory used to locate user configuration.
-            cwd: Working directory used to locate project configuration.
-            system_root: Filesystem root used to locate system configuration.
-
-        Returns:
-            Candidate sources, existing or not, in inspection order.
-        """
-        ...
-
-    def inspection_limitations(self) -> tuple[str, ...]:
-        """Return configuration sources static inspection cannot establish.
-
-        Returns:
-            Stable limitation descriptions in report order.
-        """
-        ...
-
-    def load_registrations(
-        self,
-        sources: tuple[ConfigSource, ...],
-    ) -> tuple[tuple[Registration, ...], tuple[Finding, ...]]:
-        """Extract registrations and structural findings in source order.
-
-        Args:
-            sources: Sources returned by `discover_sources`.
-
-        Returns:
-            Accepted registrations and source-isolated findings.
         """
         ...
 
@@ -413,7 +413,10 @@ class HostSpec(Protocol):
         ...
 
     def payload_event(self, payload: Mapping[str, object]) -> str | None:
-        """Return the event a payload carries, for hosts that do not require `--event`.
+        """Return the event a payload carries.
+
+        Every host must implement this method, including hosts whose
+        `requires_event` is `True`; those hosts may return `None`.
 
         Args:
             payload: Parsed native strict JSON object.
@@ -429,6 +432,7 @@ class HostSpec(Protocol):
         """Return whether the host payload carries no event name.
 
         Returns:
-            `True` when `--event` is required and `payload_event` is unused.
+            `True` when `--event` is required. The required `payload_event`
+            method still participates in validating the host contract.
         """
         ...

@@ -2,7 +2,6 @@
 
 import io
 import json
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -12,8 +11,8 @@ import pytest
 import sequential_hooks.hosts._skeleton as skeleton_module
 from plugins.claude._sequential_hooks._adapter import (
     _CLAUDE_FIELD_LIMIT_CHARACTERS,
-    ClaudeAdapter,
     ClaudeHost,
+    _ClaudeAdapter,
 )
 from sequential_hooks._diagnostics import Diagnostics
 from sequential_hooks._executor import _STDOUT_LIMIT_BYTES, ProcessExecutor
@@ -72,7 +71,7 @@ def _additional_context_output(text: str) -> JsonObject:
 
 
 def _assert_minimal_oversized_failure(
-    adapter: ClaudeAdapter,
+    adapter: _ClaudeAdapter,
     control: ChainControl,
     stream: io.StringIO,
     failing_step: Step,
@@ -119,16 +118,6 @@ def _decision_reason_output(text: str) -> JsonObject:
     }
 
 
-def _deep_mutation() -> JsonObject:
-    root: JsonObject = {}
-    cursor = root
-    for _index in range(sys.getrecursionlimit() + 100):
-        child: JsonObject = {}
-        cursor['next'] = child
-        cursor = child
-    return root
-
-
 def _fixture_bytes(name: str) -> bytes:
     return (_FIXTURE_ROOT / name).read_bytes()
 
@@ -137,10 +126,10 @@ def _make_adapter_with_stream(
     raw_input: bytes,
     *,
     allow_on_failure: bool = False,
-) -> tuple[ClaudeAdapter, io.StringIO]:
+) -> tuple[_ClaudeAdapter, io.StringIO]:
     payload = load_object(raw_input)
     stream = io.StringIO()
-    adapter = ClaudeAdapter(
+    adapter = _ClaudeAdapter(
         raw_input,
         payload,
         Diagnostics(stream),
@@ -153,7 +142,7 @@ def _make_adapter(
     raw_input: bytes,
     *,
     allow_on_failure: bool = False,
-) -> ClaudeAdapter:
+) -> _ClaudeAdapter:
     adapter, _stream = _make_adapter_with_stream(
         raw_input,
         allow_on_failure=allow_on_failure,
@@ -339,6 +328,42 @@ def test_claude_carriage_return_wrapped_json_is_structured(stdout: bytes) -> Non
     assert response['systemMessage'] == '[step 1: step-1]\nparsed'
 
 
+@pytest.mark.parametrize('decision', [[], {}])
+@pytest.mark.parametrize('allow_on_failure', [False, True])
+def test_claude_container_pre_decision_follows_failure_policy(
+    decision: JsonValue,
+    allow_on_failure: bool,
+) -> None:
+    raw_input = _fixture_bytes('claude_pre.json')
+    adapter, stream = _make_adapter_with_stream(
+        raw_input,
+        allow_on_failure=allow_on_failure,
+    )
+    result = _protocol_output(
+        {
+            'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'permissionDecision': decision,
+            }
+        }
+    )
+
+    control = adapter.consume(_step(1, 'invalid'), result)
+
+    assert control == ('continue' if allow_on_failure else 'stop')
+    assert adapter.step_input() == raw_input
+    response_bytes = adapter.finalize().stdout
+    response = load_object(response_bytes)
+    if allow_on_failure:
+        assert adapter.consume(_step(2), _pre_protocol('allow')) == 'continue'
+        response = load_object(adapter.finalize().stdout)
+    hook = cast('dict[str, object]', response['hookSpecificOutput'])
+    assert hook['permissionDecision'] == ('allow' if allow_on_failure else 'deny')
+    diagnostic = 'unsupported: unsupported PreToolUse permissionDecision'
+    assert diagnostic.encode() in response_bytes
+    assert diagnostic in stream.getvalue()
+
+
 def test_claude_continue_false_is_terminal_with_owned_stop_reason() -> None:
     adapter = _make_adapter(_fixture_bytes('claude_pre.json'))
 
@@ -424,32 +449,56 @@ def test_claude_current_pre_tool_rejects_orphan_legacy_reason(
     assert 'reason requires a deprecated decision' in stream.getvalue()
 
 
-def test_claude_deep_mutation_copy_propagates_atomically(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize('event', ['PreToolUse', 'PostToolUse'])
+@pytest.mark.parametrize('allow_on_failure', [False, True])
+@pytest.mark.parametrize('depth', [300, 600])
+def test_claude_deep_mutation_uses_normal_failure_policy(
+    event: str,
+    allow_on_failure: bool,
+    depth: int,
 ) -> None:
-    adapter = _make_adapter(_fixture_bytes('claude_pre.json'))
+    adapter, stream = _make_adapter_with_stream(
+        _fixture_bytes('claude_pre.json' if event == 'PreToolUse' else 'claude_post.json'),
+        allow_on_failure=allow_on_failure,
+    )
     prior_input = adapter.step_input()
-    prior_response = adapter.finalize()
-    assert adapter.step_input() == prior_input
-    assert adapter.finalize() == prior_response
-    mutation = _deep_mutation()
+    field = 'updatedInput' if event == 'PreToolUse' else 'updatedToolOutput'
+    hook = (
+        f'{{"hookSpecificOutput":{{"hookEventName":"{event}",'.encode()
+        + (b'"permissionDecision":"allow",' if event == 'PreToolUse' else b'')
+        + f'"{field}":'.encode()
+    )
+    mutation = (
+        b'{"command":"replacement","nested":' + b'{"next":' * depth + b'null' + b'}' * depth + b'}'
+    )
+    stdout = hook + mutation + b'}}'
+    # The actual strict loader accepts both depths; rejection belongs to composition.
+    load_object(stdout)
+    steps = (_step(1, 'mutator'), _step(2, 'later'))
+    executor = _QueueExecutor([_output(stdout), _protocol_output({'systemMessage': 'later ran'})])
 
-    def load_deep_mutation(_stdout: bytes) -> JsonObject:
-        return {
-            'hookSpecificOutput': {
-                'hookEventName': 'PreToolUse',
-                'permissionDecision': 'allow',
-                'updatedInput': mutation,
-            }
-        }
+    response = run_pipeline(
+        adapter,
+        steps,
+        executor,
+        None,
+        allow_on_failure=allow_on_failure,
+    )
 
-    monkeypatch.setattr(skeleton_module, 'load_object', load_deep_mutation)
-
-    with pytest.raises(RecursionError):
-        adapter.consume(_step(1), _output(b'ignored'))
-
-    assert adapter.step_input() == prior_input
-    assert adapter.finalize() == prior_response
+    rejected = depth == 600
+    stopped = rejected and event == 'PreToolUse' and not allow_on_failure
+    assert executor.calls == list(steps[:1] if stopped else steps)
+    assert response.exit_code == 0
+    assert (b'later ran' in response.stdout) is not stopped
+    if rejected:
+        assert adapter.step_input() == prior_input
+        assert 'malformed' in stream.getvalue()
+        assert b'malformed' in response.stdout
+        if stopped:
+            assert b'"permissionDecision":"deny"' in response.stdout
+    else:
+        assert adapter.step_input() != prior_input
+        assert not stream.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -578,8 +627,10 @@ def test_claude_exit_zero_parser_boundary_matches_live_host(
         assert 'step 1 (gate-b): malformed' in stream.getvalue()
 
 
+@pytest.mark.parametrize('recursive', [False, True])
 def test_claude_failed_mutation_publication_restores_exact_prior_state(
     monkeypatch: pytest.MonkeyPatch,
+    recursive: bool,
 ) -> None:
     raw_input = (
         b'{"hook_event_name":"PreToolUse","tool_name":"Bash",'
@@ -598,13 +649,13 @@ def test_claude_failed_mutation_publication_restores_exact_prior_state(
         }
     )
     assert adapter.consume(_step(1, 'prior'), prior_result) == 'continue'
-    prior_state = vars(adapter.state)
-    prior_payload = prior_state['payload']
+    prior_state = adapter.state
+    prior_payload = prior_state.payload
     prior_raw_input = adapter.step_input()
-    prior_contexts = list(cast('list[str]', prior_state['contexts']))
-    prior_messages = list(cast('list[str]', prior_state['messages']))
-    prior_decision = prior_state['decision']
-    prior_reasons = list(cast('list[str]', prior_state['decision_reasons']))
+    prior_contexts = list(prior_state.contexts)
+    prior_messages = list(prior_state.messages)
+    prior_decision = prior_state.decision
+    prior_reasons = list(prior_state.decision_reasons)
     prior_response = adapter.finalize().stdout
 
     def reject_failure(
@@ -618,6 +669,12 @@ def test_claude_failed_mutation_publication_restores_exact_prior_state(
         raise AdapterOutputError(OutputFailureKind(failure), message)
 
     monkeypatch.setattr(adapter, '_apply_failure', reject_failure)
+    if recursive:
+
+        def reject_copy(_value: object) -> object:
+            raise RecursionError('mutation copy exceeded the recursion limit')
+
+        monkeypatch.setattr(skeleton_module, 'deepcopy', reject_copy)
     candidate = _protocol_output(
         {
             'systemMessage': 'tentative message',
@@ -635,13 +692,13 @@ def test_claude_failed_mutation_publication_restores_exact_prior_state(
         adapter.consume(_step(2, 'mutator'), candidate)
 
     assert raised.value.kind is OutputFailureKind.MALFORMED
-    restored = vars(adapter.state)
-    assert restored['payload'] == prior_payload
+    restored = adapter.state
+    assert restored.payload == prior_payload
     assert adapter.step_input() is prior_raw_input
-    assert restored['contexts'] == prior_contexts
-    assert restored['messages'] == prior_messages
-    assert restored['decision'] == prior_decision
-    assert restored['decision_reasons'] == prior_reasons
+    assert restored.contexts == prior_contexts
+    assert restored.messages == prior_messages
+    assert restored.decision == prior_decision
+    assert restored.decision_reasons == prior_reasons
     assert adapter.finalize().stdout is prior_response
 
 
@@ -938,6 +995,39 @@ def test_claude_final_fit_preserves_complete_winning_reason_label() -> None:
 
 @pytest.mark.parametrize('event_fixture', ['claude_pre.json', 'claude_post.json'])
 @pytest.mark.parametrize('allow_on_failure', [False, True])
+def test_claude_final_fit_preserves_reasonless_terminal_after_prior_mutation(
+    event_fixture: str,
+    allow_on_failure: bool,
+) -> None:
+    mutation = _tight_budget_mutation()
+    adapter = _make_adapter(
+        _fixture_bytes(event_fixture),
+        allow_on_failure=allow_on_failure,
+    )
+    initial = (
+        _pre_protocol('allow', updated_input=mutation)
+        if event_fixture == 'claude_pre.json'
+        else _post_protocol(updated_output=mutation)
+    )
+    adapter.consume(_step(1, 'mutator'), initial)
+
+    control = adapter.consume(
+        _step(2, 'terminal'),
+        _protocol_output({'continue': False}),
+    )
+
+    assert control == 'stop'
+    response = load_object(adapter.finalize().stdout)
+    assert response['continue'] is False
+    assert 'stopReason' not in response
+    hook = cast('dict[str, object]', response['hookSpecificOutput'])
+    mutation_field = 'updatedInput' if event_fixture == 'claude_pre.json' else 'updatedToolOutput'
+    assert hook[mutation_field] == mutation
+    assert len(adapter.finalize().stdout) <= FINAL_RESPONSE_LIMIT_BYTES
+
+
+@pytest.mark.parametrize('event_fixture', ['claude_pre.json', 'claude_post.json'])
+@pytest.mark.parametrize('allow_on_failure', [False, True])
 def test_claude_final_fit_truncates_stop_reason_and_preserves_terminal(
     event_fixture: str,
     allow_on_failure: bool,
@@ -1069,10 +1159,10 @@ def test_claude_fitting_builds_and_encodes_each_candidate_once(
         ),
     )
     counts = {'build': 0, 'encode': 0}
-    final_object = ClaudeAdapter.build_response
+    final_object = _ClaudeAdapter.build_response
     encode_response = skeleton_module.encode_response
 
-    def counted_final_object(self: ClaudeAdapter) -> JsonObject:
+    def counted_final_object(self: _ClaudeAdapter) -> JsonObject:
         counts['build'] += 1
         return final_object(self)
 
@@ -1080,7 +1170,7 @@ def test_claude_fitting_builds_and_encodes_each_candidate_once(
         counts['encode'] += 1
         return encode_response(response)
 
-    monkeypatch.setattr(ClaudeAdapter, 'build_response', counted_final_object)
+    monkeypatch.setattr(_ClaudeAdapter, 'build_response', counted_final_object)
     monkeypatch.setattr(skeleton_module, 'encode_response', counted_encode_response)
 
     control = adapter.consume(
@@ -1115,42 +1205,6 @@ def test_claude_hook_specific_event_mismatch_follows_failure_policy(
             'str',
             load_object(adapter.finalize().stdout)['systemMessage'],
         )
-
-
-@pytest.mark.parametrize('decision', [[], {}])
-@pytest.mark.parametrize('allow_on_failure', [False, True])
-def test_claude_container_pre_decision_follows_failure_policy(
-    decision: JsonValue,
-    allow_on_failure: bool,
-) -> None:
-    raw_input = _fixture_bytes('claude_pre.json')
-    adapter, stream = _make_adapter_with_stream(
-        raw_input,
-        allow_on_failure=allow_on_failure,
-    )
-    result = _protocol_output(
-        {
-            'hookSpecificOutput': {
-                'hookEventName': 'PreToolUse',
-                'permissionDecision': decision,
-            }
-        }
-    )
-
-    control = adapter.consume(_step(1, 'invalid'), result)
-
-    assert control == ('continue' if allow_on_failure else 'stop')
-    assert adapter.step_input() == raw_input
-    response_bytes = adapter.finalize().stdout
-    response = load_object(response_bytes)
-    if allow_on_failure:
-        assert adapter.consume(_step(2), _pre_protocol('allow')) == 'continue'
-        response = load_object(adapter.finalize().stdout)
-    hook = cast('dict[str, object]', response['hookSpecificOutput'])
-    assert hook['permissionDecision'] == ('allow' if allow_on_failure else 'deny')
-    diagnostic = 'unsupported: unsupported PreToolUse permissionDecision'
-    assert diagnostic.encode() in response_bytes
-    assert diagnostic in stream.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -1586,7 +1640,7 @@ def test_claude_native_block_drops_mutation_as_last_resort(
         ),
     )
     assert seeded == 'continue'
-    fit_response = ClaudeAdapter.fit_response
+    fit_response = _ClaudeAdapter.fit_response
     calls = {'count': 0}
 
     def failing_fit(
@@ -2206,39 +2260,6 @@ def test_claude_whitespace_only_stdout_is_neutral(stdout: bytes) -> None:
     assert adapter.finalize().stdout == b''
 
 
-@pytest.mark.parametrize('event_fixture', ['claude_pre.json', 'claude_post.json'])
-@pytest.mark.parametrize('allow_on_failure', [False, True])
-def test_claude_final_fit_preserves_reasonless_terminal_after_prior_mutation(
-    event_fixture: str,
-    allow_on_failure: bool,
-) -> None:
-    mutation = _tight_budget_mutation()
-    adapter = _make_adapter(
-        _fixture_bytes(event_fixture),
-        allow_on_failure=allow_on_failure,
-    )
-    initial = (
-        _pre_protocol('allow', updated_input=mutation)
-        if event_fixture == 'claude_pre.json'
-        else _post_protocol(updated_output=mutation)
-    )
-    adapter.consume(_step(1, 'mutator'), initial)
-
-    control = adapter.consume(
-        _step(2, 'terminal'),
-        _protocol_output({'continue': False}),
-    )
-
-    assert control == 'stop'
-    response = load_object(adapter.finalize().stdout)
-    assert response['continue'] is False
-    assert 'stopReason' not in response
-    hook = cast('dict[str, object]', response['hookSpecificOutput'])
-    mutation_field = 'updatedInput' if event_fixture == 'claude_pre.json' else 'updatedToolOutput'
-    assert hook[mutation_field] == mutation
-    assert len(adapter.finalize().stdout) <= FINAL_RESPONSE_LIMIT_BYTES
-
-
 @pytest.mark.parametrize('event', ['PreToolUse', 'PostToolUse'])
 def test_configuration_response_is_independent_of_adapter_construction(
     event: str,
@@ -2247,7 +2268,7 @@ def test_configuration_response_is_independent_of_adapter_construction(
     def unavailable(*_args: object, **_kwargs: object) -> None:
         raise AssertionError('configuration response must not construct an adapter')
 
-    monkeypatch.setattr('plugins.claude._sequential_hooks._adapter.ClaudeAdapter', unavailable)
+    monkeypatch.setattr('plugins.claude._sequential_hooks._adapter._ClaudeAdapter', unavailable)
     monkeypatch.setattr(ClaudeHost, 'adapter', unavailable)
     stream = io.StringIO()
     response = ClaudeHost().configuration_response(

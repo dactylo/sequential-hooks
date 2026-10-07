@@ -20,6 +20,7 @@ class FailingMetadataHost:
         raise RuntimeError('host event metadata unavailable')
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_built_in_hosts_load_only_through_entry_points() -> None:
     requirements = host_requirements()
     assert set(requirements) == set(BUILTIN_ENTRY_POINTS)

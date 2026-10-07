@@ -1,7 +1,8 @@
 # Documentation
 
-Start with the project [quick start](../README.md#quick-start). It installs the current checkout,
-routes you to the correct host setup guide, and shows how to verify the saved registration.
+Start with the project [installation](../README.md#installation) and
+[quick start](../README.md#quick-start). The quick start routes you to the correct host setup guide
+and shows how to verify the saved registration.
 
 ## Get started
 
@@ -16,7 +17,7 @@ routes you to the correct host setup guide, and shows how to verify the saved re
 - [Concepts](concepts.md): ordering, replacements, decisions, and diagnostics.
 - [Security](security.md): trust boundaries and pre-permission execution.
 - [Platforms](platforms.md): process containment on POSIX and native Windows.
-- [Compatibility](compatibility.md): recorded host CLI versions and known host limits.
+- [Compatibility](compatibility.md): supported hosts and known host limits.
 
 ## Reference
 

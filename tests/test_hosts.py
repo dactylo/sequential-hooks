@@ -15,8 +15,8 @@ from sequential_hooks._types import Step
 from tests._helpers import CHILD_TIMEOUT_SECONDS, invoke_cli, process_transcript
 from tests.hosts_example.host import ExampleHost, ExampleResponse
 
-_PRE_INPUT = b'{"tool":"shell","arguments":{"command":"echo hi"}}\n'
 _POST_INPUT = b'{"tool":"shell","output":"hi"}\n'
+_PRE_INPUT = b'{"tool":"shell","arguments":{"command":"echo hi"}}\n'
 _PYTHON = Path(sys.executable).name
 
 
@@ -69,7 +69,7 @@ def test_doctor_drives_the_example_loader(example_hosts: Path, tmp_path: Path) -
     report = stream.getvalue()
     assert status == 1
     assert 'agent: example' in report
-    source = str(home / '.example' / 'hooks.json').encode('unicode_escape').decode('ascii')
+    source = (home / '.example' / 'hooks.json').as_posix().encode('unicode_escape').decode('ascii')
     assert f'[user] {source}: exists' in report
     assert 'event: BeforeTool' in report
     assert '[info] example_unmatched' in report

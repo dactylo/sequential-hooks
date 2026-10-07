@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple, Protocol
 from unittest import mock
@@ -40,10 +41,15 @@ class _Outcome(Protocol):
 
 
 class _StepOutcome(NamedTuple):
-    args: str | Sequence[str]
+    args: object
     returncode: int | None
     stdout: bytes
     stderr: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class FixtureResult(StepResult):
+    command: tuple[str, ...]
 
 
 def _describe_status(returncode: int | None) -> str:
@@ -64,13 +70,6 @@ def _escape_transcript_line(line: str) -> str:
     if body.startswith('::'):
         line = line[: len(line) - len(body)] + '\\' + body
     return line
-
-
-def _exit_status(error: SystemExit) -> int:
-    code = error.code
-    if code is None:
-        return 0
-    return code if isinstance(code, int) else 1
 
 
 def _terminate_tree[T: (str, bytes)](process: subprocess.Popen[T]) -> None:
@@ -120,6 +119,17 @@ def decode_text(data: bytes) -> str:
     return data.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
 
 
+def fixture_result(result: StepResult, command: tuple[str, ...]) -> FixtureResult:
+    return FixtureResult(
+        result.returncode,
+        result.stdout,
+        result.blocking_stderr,
+        result.failure,
+        result.containment,
+        command=command,
+    )
+
+
 def process_transcript(
     result: _Outcome,
     *,
@@ -156,9 +166,12 @@ def _kill_and_describe[T: (str, bytes)](
 
 
 def step_transcript(
-    result: StepResult, diagnostics: str = '', *, command: Sequence[str] | str = '<hook step>'
+    result: StepResult, diagnostics: str = '', *, command: object | None = None
 ) -> str:
-    outcome = _StepOutcome(command, result.returncode, result.stdout, result.blocking_stderr)
+    displayed_command = getattr(result, 'command', '<hook step>') if command is None else command
+    outcome = _StepOutcome(
+        displayed_command, result.returncode, result.stdout, result.blocking_stderr
+    )
     return '\n'.join(
         [process_transcript(outcome), *_transcript_stream('diagnostics', diagnostics)]
     )
@@ -178,6 +191,31 @@ def finish_process[T: (str, bytes)](
             _kill_and_describe(process, cwd=cwd, reason=f'timed out after {timeout:g} s')
         ) from None
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
+def invoke_cli(
+    argv: Sequence[str],
+    stdin: bytes | io.BytesIO = b'',
+    *,
+    cwd: Path | str | None = None,
+) -> tuple[int, bytes, str]:
+    stdin_buffer = stdin if isinstance(stdin, io.BytesIO) else io.BytesIO(stdin)
+    stdout_buffer = io.BytesIO()
+    stderr_buffer = io.BytesIO()
+    stdout = io.TextIOWrapper(stdout_buffer, encoding='utf-8', newline='')
+    stderr = io.TextIOWrapper(stderr_buffer, encoding='utf-8', newline='')
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(sys, 'stdin', io.TextIOWrapper(stdin_buffer, encoding='utf-8'))
+        )
+        stack.enter_context(contextlib.redirect_stdout(stdout))
+        stack.enter_context(contextlib.redirect_stderr(stderr))
+        if cwd is not None:
+            stack.enter_context(contextlib.chdir(cwd))
+        status = main(argv)
+        stdout.flush()
+        stderr.flush()
+    return status, stdout_buffer.getvalue(), stderr_buffer.getvalue().decode('utf-8')
 
 
 def run_cli(  # noqa: PLR0913
@@ -293,31 +331,3 @@ def run_with_closed_output(
     finally:
         os.close(write_fd)
     return finish_process(process, stdin=stdin, timeout=timeout)
-
-
-def invoke_cli(
-    argv: Sequence[str],
-    stdin: bytes | io.BytesIO = b'',
-    *,
-    cwd: Path | str | None = None,
-) -> tuple[int, bytes, str]:
-    stdin_buffer = stdin if isinstance(stdin, io.BytesIO) else io.BytesIO(stdin)
-    stdout_buffer = io.BytesIO()
-    stderr_buffer = io.BytesIO()
-    stdout = io.TextIOWrapper(stdout_buffer, encoding='utf-8', newline='')
-    stderr = io.TextIOWrapper(stderr_buffer, encoding='utf-8', newline='')
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            mock.patch.object(sys, 'stdin', io.TextIOWrapper(stdin_buffer, encoding='utf-8'))
-        )
-        stack.enter_context(contextlib.redirect_stdout(stdout))
-        stack.enter_context(contextlib.redirect_stderr(stderr))
-        if cwd is not None:
-            stack.enter_context(contextlib.chdir(cwd))
-        try:
-            status = main(argv)
-        except SystemExit as error:
-            status = _exit_status(error)
-        stdout.flush()
-        stderr.flush()
-    return status, stdout_buffer.getvalue(), stderr_buffer.getvalue().decode('utf-8')

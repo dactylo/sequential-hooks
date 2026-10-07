@@ -44,6 +44,7 @@ class PosixBackend:
 
         Raises:
             ContainmentError: If fallback was not explicitly allowed.
+            OSError: If starting the fallback process fails.
         """
         del failed
         if not allow_uncontained:
@@ -60,6 +61,9 @@ class PosixBackend:
 
         Returns:
             Managed POSIX process group.
+
+        Raises:
+            OSError: If starting the process fails.
         """
         del allow_uncontained
         return _PosixManagedStep(step)

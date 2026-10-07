@@ -37,7 +37,13 @@ from sequential_hooks._executor import (
 )
 from sequential_hooks._runner import run_pipeline
 from sequential_hooks._types import ContainmentState, FailureKind, Step, StepResult
-from tests._helpers import CHILD_TIMEOUT_SECONDS, PROCESS_GROUP_FLAGS, step_transcript
+from tests._helpers import (
+    CHILD_TIMEOUT_SECONDS,
+    PROCESS_GROUP_FLAGS,
+    FixtureResult,
+    fixture_result,
+    step_transcript,
+)
 
 if TYPE_CHECKING:
     from sequential_hooks.hosts import JsonObject, NativeResponse
@@ -617,7 +623,7 @@ def _assert_lifecycle_order(events: list[str], *, terminated: bool) -> None:
     finish = events.index('finish')
     first_join = min(index for index, event in enumerate(events) if event.startswith('join '))
 
-    assert stdout_start < stderr_start < stdin_start < release
+    assert max(stdout_start, stderr_start) < stdin_start < release
     if terminated:
         assert release < events.index('terminate') < finish
     assert finish < first_join
@@ -724,14 +730,16 @@ def _run_fixture(
     diagnostics: Diagnostics | None = None,
     input_bytes: bytes = b'{}\n',
     timeout: float | None = CHILD_TIMEOUT_SECONDS,
-) -> StepResult:
+) -> FixtureResult:
     selected_diagnostics = diagnostics or Diagnostics(StringIO())
-    return ProcessExecutor(selected_diagnostics).run(
-        Step(1, (sys.executable, str(_FIXTURE), mode, *args)),
+    command = (sys.executable, str(_FIXTURE), mode, *args)
+    result = ProcessExecutor(selected_diagnostics).run(
+        Step(1, command),
         input_bytes,
         timeout,
         allow_uncontained=False,
     )
+    return fixture_result(result, command)
 
 
 def _start_background_call(
@@ -885,11 +893,7 @@ def test_close_stdin_pipe_classifies_closed_pipe_errors(
 def test_executor_accepts_exact_stdout_limit() -> None:
     stream = StringIO()
     result = _run_fixture('stdout-bytes', str(1024 * 1024), diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(sys.executable, str(_FIXTURE), 'stdout-bytes', str(1024 * 1024)),
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert len(result.stdout) == 1024 * 1024, result_transcript
@@ -928,7 +932,7 @@ def test_executor_bounds_output_worker_join_and_closes_parent_pipe(
         result_transcript = step_transcript(
             result,
             stream.getvalue(),
-            command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
+            command=backend.managed_steps[-1].process.args,
         )
         assert result.failure is not None, result_transcript
         assert result.failure.kind is FailureKind.OUTPUT_WORKER_TIMEOUT, result_transcript
@@ -969,6 +973,91 @@ def test_executor_cancels_real_blocked_pipe_without_blocking_main_thread(
     assert backend.managed.close_finished.wait(CHILD_TIMEOUT_SECONDS)
     assert backend.managed.stdout.closed
     assert backend.managed.close_threads == ['sequential-hooks-step-1-stdout-cancel']
+
+
+@pytest.mark.parametrize(
+    ('platform', 'error', 'benign'),
+    [
+        pytest.param('win32', OSError(errno.EINVAL, 'invalid'), True, id='windows-einval'),
+        pytest.param('darwin', OSError(errno.EIO, 'io'), False, id='posix-eio'),
+    ],
+)
+def test_executor_classifies_normal_stdin_owner_close_error(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    error: OSError,
+    benign: bool,
+) -> None:
+    stream = StringIO()
+    backend = _StdinErrorBackend(block_write=False, close_error=error)
+    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
+    monkeypatch.setattr(_executor, 'resolve_executable', _resolve_test_executable)
+    monkeypatch.setattr(_executor, 'sys', SimpleNamespace(platform=platform))
+
+    if benign:
+        result = _run_fixture('exit-without-stdin', diagnostics=Diagnostics(stream))
+        result_transcript = step_transcript(result, stream.getvalue())
+        assert result.failure is None, result_transcript
+        assert result.returncode == 0, result_transcript
+    else:
+        with pytest.raises(OSError, match=error.strerror or '') as caught:
+            _run_fixture('exit-without-stdin')
+        assert caught.value is error
+
+    assert backend.managed is not None
+    assert backend.managed.close_stream.close_attempts == 1
+    assert backend.managed.close_stream.closed
+
+
+@pytest.mark.parametrize(
+    ('platform', 'error', 'benign'),
+    [
+        pytest.param('win32', OSError(errno.EINVAL, 'invalid'), True, id='windows-einval'),
+        pytest.param('darwin', OSError(errno.EIO, 'io'), False, id='posix-eio'),
+    ],
+)
+def test_executor_classifies_timed_out_stdin_cancel_close_error(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    error: OSError,
+    benign: bool,
+) -> None:
+    stream = StringIO()
+    backend = _StdinErrorBackend(block_write=True, close_error=error)
+    uncaught_errors: list[BaseException] = []
+    uncaught = threading.Event()
+    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
+    monkeypatch.setattr(_executor, 'resolve_executable', _resolve_test_executable)
+    monkeypatch.setattr(_executor, 'sys', SimpleNamespace(platform=platform))
+
+    def record_uncaught(args: threading.ExceptHookArgs) -> None:
+        if args.exc_value is not None:
+            uncaught_errors.append(args.exc_value)
+        uncaught.set()
+
+    monkeypatch.setattr(threading, 'excepthook', record_uncaught)
+    try:
+        if benign:
+            result = _run_fixture('exit-without-stdin', diagnostics=Diagnostics(stream))
+            result_transcript = step_transcript(result, stream.getvalue())
+            assert result.failure is not None, result_transcript
+            assert result.failure.kind is FailureKind.OUTPUT_WORKER_TIMEOUT, result_transcript
+        else:
+            with pytest.raises(OSError, match=error.strerror or '') as caught:
+                _run_fixture('exit-without-stdin')
+            assert caught.value is error
+        assert backend.managed is not None
+        assert backend.managed.close_stream.write_started.is_set()
+        assert backend.managed.close_stream.close_started.wait(0.2)
+        uncaught.wait(0.1)
+    finally:
+        if backend.managed is not None:
+            backend.managed.close_stream.release_write.set()
+
+    assert backend.managed is not None
+    assert backend.managed.close_stream.close_attempts == 1
+    assert backend.managed.close_stream.closed
+    assert uncaught_errors == []
 
 
 def test_executor_cleans_managed_step_when_attempt_construction_fails(
@@ -1196,25 +1285,14 @@ def test_executor_drains_past_stderr_chain_limit_with_one_notice() -> None:
             str(_STDERR_STEP_LIMIT_BYTES),
             diagnostics=diagnostics,
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(
-                sys.executable,
-                str(_FIXTURE),
-                'stderr-bytes',
-                str(_STDERR_STEP_LIMIT_BYTES),
-            ),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
         assert result.failure is None, result_transcript
     exhausted = _run_fixture(
         'stderr-bytes',
         '1',
         diagnostics=diagnostics,
     )
-    exhausted_transcript = step_transcript(
-        exhausted, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'stderr-bytes', '1')
-    )
+    exhausted_transcript = step_transcript(exhausted, stream.getvalue())
 
     assert exhausted.failure is None, exhausted_transcript
     assert exhausted.blocking_stderr == '', exhausted_transcript
@@ -1231,16 +1309,7 @@ def test_executor_drains_past_stderr_step_limit_with_one_notice() -> None:
         str(_STDERR_STEP_LIMIT_BYTES + 1),
         diagnostics=Diagnostics(stream),
     )
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(
-            sys.executable,
-            str(_FIXTURE),
-            'stderr-bytes',
-            str(_STDERR_STEP_LIMIT_BYTES + 1),
-        ),
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert len(result.blocking_stderr.encode()) == _STDERR_STEP_LIMIT_BYTES, result_transcript
@@ -1269,7 +1338,7 @@ def test_executor_fails_closed_when_release_recovery_is_not_allowed(
     result_transcript = step_transcript(
         result,
         stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
+        command=backend.managed_steps[-1].process.args,
     )
 
     assert len(backend.managed_steps) == 1, result_transcript
@@ -1326,9 +1395,7 @@ def test_executor_ignores_broken_pipe_after_early_success() -> None:
     result = _run_fixture(
         'exit-without-stdin', input_bytes=b'x' * (8 * 1024 * 1024), diagnostics=Diagnostics(stream)
     )
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'exit-without-stdin')
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert result.returncode == 0, result_transcript
@@ -1339,9 +1406,7 @@ def test_executor_labels_stderr_without_mixing_it_into_stdout() -> None:
     stream = StringIO()
 
     result = _run_fixture('stderr', 'warning', diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'stderr', 'warning')
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert result.stdout == b'', result_transcript
@@ -1349,6 +1414,18 @@ def test_executor_labels_stderr_without_mixing_it_into_stdout() -> None:
     assert stream.getvalue() == (
         f'sequential-hooks: step 1 ({Path(sys.executable).name}): warning\n'
     ), result_transcript
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='negative signal return codes are POSIX-specific')
+def test_executor_maps_child_signal_to_crash() -> None:
+    stream = StringIO()
+    result = _run_fixture('self-signal', str(signal.SIGTERM), diagnostics=Diagnostics(stream))
+    result_transcript = step_transcript(result, stream.getvalue())
+
+    assert result.returncode == -signal.SIGTERM, result_transcript
+    assert result.failure is not None, result_transcript
+    assert result.failure.kind is FailureKind.CRASH, result_transcript
+    assert result.failure.returncode == -signal.SIGTERM, result_transcript
 
 
 def test_executor_maps_containment_start_failure(
@@ -1437,10 +1514,8 @@ def test_executor_observes_late_cancellation_close_failure(
         threading.Event(),
         threading.Event(),
     )
-    results, uncaught_errors = cast(
-        'tuple[list[StepResult], list[BaseException]]',
-        ([], []),
-    )
+    results: list[StepResult] = []
+    uncaught_errors: list[BaseException] = []
     real_cancellation_close, real_relay_close = (
         cast('Callable[..., object]', vars(_executor)['_CancellationClose']),
         StderrRelay.close,
@@ -1508,6 +1583,57 @@ def test_executor_observes_late_cancellation_close_failure(
         results,
         uncaught_errors,
     )
+
+
+@pytest.mark.parametrize(
+    'scenario',
+    [
+        ('exit-without-stdin', (), None, None, False),
+        ('sleep', ('10',), 0.05, FailureKind.TIMEOUT, True),
+        (
+            'stdout-bytes-then-sleep',
+            (str(1024 * 1024 + 1), '10'),
+            0.5,
+            FailureKind.OUTPUT_LIMIT,
+            True,
+        ),
+    ],
+)
+def test_executor_orders_managed_lifecycle_before_worker_joins(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: tuple[
+        str,
+        tuple[str, ...],
+        float | None,
+        FailureKind | None,
+        bool,
+    ],
+) -> None:
+    stream = StringIO()
+    mode, args, timeout, failure_kind, terminated = scenario
+    events: list[str] = []
+    backend = _RecordingBackend(events)
+    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
+    _record_thread_lifecycle(monkeypatch, events)
+
+    result = _run_fixture(
+        mode,
+        *args,
+        timeout=CHILD_TIMEOUT_SECONDS if timeout is None else timeout,
+        diagnostics=Diagnostics(stream),
+    )
+    result_transcript = step_transcript(
+        result,
+        stream.getvalue(),
+        command=backend.managed_steps[-1].process.args,
+    )
+
+    assert (result.failure.kind if result.failure is not None else None) is failure_kind, (
+        result_transcript
+    )
+    if failure_kind is None:
+        assert result.returncode == 0, result_transcript
+    _assert_lifecycle_order(events, terminated=terminated)
 
 
 def test_executor_orders_worker_exception_cleanup_before_reraising(
@@ -1581,6 +1707,18 @@ def test_executor_output_timeout_does_not_block_adapter_failure() -> None:
     assert b'"permissionDecision":"deny"' in response.stdout
 
 
+@pytest.mark.parametrize('returncode', [1, 2])
+def test_executor_preserves_nonzero_status_and_stderr_for_adapter(returncode: int) -> None:
+    stream = StringIO()
+    result = _run_fixture('exit', str(returncode), 'blocked', diagnostics=Diagnostics(stream))
+    result_transcript = step_transcript(result, stream.getvalue())
+
+    assert result.failure is None, result_transcript
+    assert result.returncode == returncode, result_transcript
+    assert result.stdout == b'', result_transcript
+    assert result.blocking_stderr == 'blocked\n', result_transcript
+
+
 def test_executor_preserves_requested_name_in_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1620,7 +1758,7 @@ def test_executor_preserves_requested_name_in_diagnostics(
     result_transcript = step_transcript(
         result,
         stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
+        command=backend.managed_steps[-1].process.args,
     )
 
     assert result.failure is None, result_transcript
@@ -1659,11 +1797,46 @@ def test_executor_preserves_timeout_when_output_limit_arrives_during_cleanup(
     result_transcript = step_transcript(
         result,
         stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
+        command=backend.managed_steps[-1].process.args,
     )
 
     assert result.failure is not None, result_transcript
     assert result.failure.kind is FailureKind.TIMEOUT, result_transcript
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='signal forwarding uses POSIX signals')
+def test_executor_raises_signal_between_steps_before_backend_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    backend = _RecordingBackend(events)
+    stream = StringIO()
+    executor = ProcessExecutor(Diagnostics(stream))
+    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
+
+    with executor.signal_forwarding():
+        first = executor.run(
+            Step(1, (sys.executable, str(_FIXTURE), 'exit-without-stdin')),
+            b'{}\n',
+            CHILD_TIMEOUT_SECONDS,
+            allow_uncontained=False,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)
+        with pytest.raises(ForwardedSignal) as raised:
+            executor.run(
+                Step(2, (sys.executable, str(_FIXTURE), 'exit-without-stdin')),
+                b'{}\n',
+                None,
+                allow_uncontained=False,
+            )
+
+    assert first.failure is None, step_transcript(
+        first,
+        stream.getvalue(),
+        command=backend.managed_steps[0].process.args,
+    )
+    assert raised.value.signum == signal.SIGTERM
+    assert events.count('start') == 1
 
 
 def test_executor_raises_signal_recorded_during_resolution_before_backend_start(
@@ -1739,7 +1912,7 @@ def test_executor_recovers_release_failure_with_fresh_workers_and_input(
     result_transcript = step_transcript(
         result,
         stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
+        command=backend.managed_steps[-1].process.args,
     )
 
     first = backend.managed_steps[0]
@@ -1796,9 +1969,7 @@ def test_executor_replaces_invalid_stderr_and_keeps_result_usable() -> None:
     stream = StringIO()
 
     result = _run_fixture('invalid-stderr', diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'invalid-stderr')
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert result.returncode == 0, result_transcript
@@ -1834,9 +2005,7 @@ def test_executor_round_trips_stdin_bytes() -> None:
     input_bytes = b'{"message":"caf\xc3\xa9"}\n'
 
     result = _run_fixture('echo-input', input_bytes=input_bytes, diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'echo-input')
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert result.returncode == 0, result_transcript
@@ -1846,11 +2015,7 @@ def test_executor_round_trips_stdin_bytes() -> None:
 def test_executor_terminates_tree_over_stdout_limit() -> None:
     stream = StringIO()
     result = _run_fixture('stdout-bytes', str(1024 * 1024 + 1), diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(sys.executable, str(_FIXTURE), 'stdout-bytes', str(1024 * 1024 + 1)),
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is not None, result_transcript
     assert result.failure.kind is FailureKind.OUTPUT_LIMIT, result_transcript
@@ -1907,7 +2072,7 @@ def test_executor_uses_platform_absolute_path_for_relative_resolution(
     result_transcript = step_transcript(
         result,
         stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
+        command=backend.managed_steps[-1].process.args,
     )
 
     launch_step = Step(1, (str(Path.cwd() / 'platform-absolute-hook.exe'),))
@@ -2105,236 +2270,6 @@ def test_stderr_reader_forwards_buffered_chunk_before_eof() -> None:
     assert output.getvalue() == 'sequential-hooks: step 1 (hook): available now\n'
 
 
-@pytest.mark.parametrize(('platform', 'error', 'benign'), _STDIN_ERROR_CASES)
-def test_write_stdin_classifies_closed_pipe_errors(
-    monkeypatch: pytest.MonkeyPatch,
-    platform: str,
-    error: OSError,
-    benign: bool,
-) -> None:
-    stream = _StdinErrorStream(BytesIO(), block_write=False, write_error=error)
-    monkeypatch.setattr(_executor, 'sys', SimpleNamespace(platform=platform))
-
-    if benign:
-        _executor._write_stdin(cast('BinaryIO', stream), b'input')
-    else:
-        with pytest.raises(OSError, match=error.strerror or '') as caught:
-            _executor._write_stdin(cast('BinaryIO', stream), b'input')
-        assert caught.value is error
-    assert stream.write_started.is_set()
-
-
-@pytest.mark.parametrize(
-    ('platform', 'error', 'benign'),
-    [
-        pytest.param('win32', OSError(errno.EINVAL, 'invalid'), True, id='windows-einval'),
-        pytest.param('darwin', OSError(errno.EIO, 'io'), False, id='posix-eio'),
-    ],
-)
-def test_executor_classifies_normal_stdin_owner_close_error(
-    monkeypatch: pytest.MonkeyPatch,
-    platform: str,
-    error: OSError,
-    benign: bool,
-) -> None:
-    stream = StringIO()
-    backend = _StdinErrorBackend(block_write=False, close_error=error)
-    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
-    monkeypatch.setattr(_executor, 'resolve_executable', _resolve_test_executable)
-    monkeypatch.setattr(_executor, 'sys', SimpleNamespace(platform=platform))
-
-    if benign:
-        result = _run_fixture('exit-without-stdin', diagnostics=Diagnostics(stream))
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(sys.executable, str(_FIXTURE), 'exit-without-stdin'),
-        )
-        assert result.failure is None, result_transcript
-        assert result.returncode == 0, result_transcript
-    else:
-        with pytest.raises(OSError, match=error.strerror or '') as caught:
-            _run_fixture('exit-without-stdin')
-        assert caught.value is error
-
-    assert backend.managed is not None
-    assert backend.managed.close_stream.close_attempts == 1
-    assert backend.managed.close_stream.closed
-
-
-@pytest.mark.parametrize(
-    ('platform', 'error', 'benign'),
-    [
-        pytest.param('win32', OSError(errno.EINVAL, 'invalid'), True, id='windows-einval'),
-        pytest.param('darwin', OSError(errno.EIO, 'io'), False, id='posix-eio'),
-    ],
-)
-def test_executor_classifies_timed_out_stdin_cancel_close_error(
-    monkeypatch: pytest.MonkeyPatch,
-    platform: str,
-    error: OSError,
-    benign: bool,
-) -> None:
-    stream = StringIO()
-    backend = _StdinErrorBackend(block_write=True, close_error=error)
-    uncaught_errors: list[BaseException] = []
-    uncaught = threading.Event()
-    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
-    monkeypatch.setattr(_executor, 'resolve_executable', _resolve_test_executable)
-    monkeypatch.setattr(_executor, 'sys', SimpleNamespace(platform=platform))
-
-    def record_uncaught(args: threading.ExceptHookArgs) -> None:
-        if args.exc_value is not None:
-            uncaught_errors.append(args.exc_value)
-        uncaught.set()
-
-    monkeypatch.setattr(threading, 'excepthook', record_uncaught)
-    try:
-        if benign:
-            result = _run_fixture('exit-without-stdin', diagnostics=Diagnostics(stream))
-            result_transcript = step_transcript(
-                result,
-                stream.getvalue(),
-                command=(sys.executable, str(_FIXTURE), 'exit-without-stdin'),
-            )
-            assert result.failure is not None, result_transcript
-            assert result.failure.kind is FailureKind.OUTPUT_WORKER_TIMEOUT, result_transcript
-        else:
-            with pytest.raises(OSError, match=error.strerror or '') as caught:
-                _run_fixture('exit-without-stdin')
-            assert caught.value is error
-        assert backend.managed is not None
-        assert backend.managed.close_stream.write_started.is_set()
-        assert backend.managed.close_stream.close_started.wait(0.2)
-        uncaught.wait(0.1)
-    finally:
-        if backend.managed is not None:
-            backend.managed.close_stream.release_write.set()
-
-    assert backend.managed is not None
-    assert backend.managed.close_stream.close_attempts == 1
-    assert backend.managed.close_stream.closed
-    assert uncaught_errors == []
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='negative signal return codes are POSIX-specific')
-def test_executor_maps_child_signal_to_crash() -> None:
-    stream = StringIO()
-    result = _run_fixture('self-signal', str(signal.SIGTERM), diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(sys.executable, str(_FIXTURE), 'self-signal', str(signal.SIGTERM)),
-    )
-
-    assert result.returncode == -signal.SIGTERM, result_transcript
-    assert result.failure is not None, result_transcript
-    assert result.failure.kind is FailureKind.CRASH, result_transcript
-    assert result.failure.returncode == -signal.SIGTERM, result_transcript
-
-
-@pytest.mark.parametrize(
-    'scenario',
-    [
-        ('exit-without-stdin', (), None, None, False),
-        ('sleep', ('10',), 0.05, FailureKind.TIMEOUT, True),
-        (
-            'stdout-bytes-then-sleep',
-            (str(1024 * 1024 + 1), '10'),
-            0.5,
-            FailureKind.OUTPUT_LIMIT,
-            True,
-        ),
-    ],
-)
-def test_executor_orders_managed_lifecycle_before_worker_joins(
-    monkeypatch: pytest.MonkeyPatch,
-    scenario: tuple[
-        str,
-        tuple[str, ...],
-        float | None,
-        FailureKind | None,
-        bool,
-    ],
-) -> None:
-    stream = StringIO()
-    mode, args, timeout, failure_kind, terminated = scenario
-    events: list[str] = []
-    backend = _RecordingBackend(events)
-    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
-    _record_thread_lifecycle(monkeypatch, events)
-
-    result = _run_fixture(
-        mode,
-        *args,
-        timeout=CHILD_TIMEOUT_SECONDS if timeout is None else timeout,
-        diagnostics=Diagnostics(stream),
-    )
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[-1].process.args),
-    )
-
-    assert (result.failure.kind if result.failure is not None else None) is failure_kind, (
-        result_transcript
-    )
-    if failure_kind is None:
-        assert result.returncode == 0, result_transcript
-    _assert_lifecycle_order(events, terminated=terminated)
-
-
-@pytest.mark.parametrize('returncode', [1, 2])
-def test_executor_preserves_nonzero_status_and_stderr_for_adapter(returncode: int) -> None:
-    stream = StringIO()
-    result = _run_fixture('exit', str(returncode), 'blocked', diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(sys.executable, str(_FIXTURE), 'exit', str(returncode), 'blocked'),
-    )
-
-    assert result.failure is None, result_transcript
-    assert result.returncode == returncode, result_transcript
-    assert result.stdout == b'', result_transcript
-    assert result.blocking_stderr == 'blocked\n', result_transcript
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='signal forwarding uses POSIX signals')
-def test_executor_raises_signal_between_steps_before_backend_start(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    backend = _RecordingBackend(events)
-    stream = StringIO()
-    executor = ProcessExecutor(Diagnostics(stream))
-    monkeypatch.setattr(_executor, 'current_backend', lambda: backend)
-
-    with executor.signal_forwarding():
-        first = executor.run(
-            Step(1, (sys.executable, str(_FIXTURE), 'exit-without-stdin')),
-            b'{}\n',
-            CHILD_TIMEOUT_SECONDS,
-            allow_uncontained=False,
-        )
-        os.kill(os.getpid(), signal.SIGTERM)
-        with pytest.raises(ForwardedSignal) as raised:
-            executor.run(
-                Step(2, (sys.executable, str(_FIXTURE), 'exit-without-stdin')),
-                b'{}\n',
-                None,
-                allow_uncontained=False,
-            )
-
-    assert first.failure is None, step_transcript(
-        first,
-        stream.getvalue(),
-        command=cast('tuple[str, ...]', backend.managed_steps[0].process.args),
-    )
-    assert raised.value.signum == signal.SIGTERM
-    assert events.count('start') == 1
-
-
 @pytest.mark.parametrize(
     ('value', 'expected'),
     [
@@ -2365,3 +2300,22 @@ def test_executor_raises_signal_between_steps_before_backend_start(
 )
 def test_windows_crash_classification_boundaries(value: int, expected: bool) -> None:
     assert _is_windows_crash(value) is expected
+
+
+@pytest.mark.parametrize(('platform', 'error', 'benign'), _STDIN_ERROR_CASES)
+def test_write_stdin_classifies_closed_pipe_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    error: OSError,
+    benign: bool,
+) -> None:
+    stream = _StdinErrorStream(BytesIO(), block_write=False, write_error=error)
+    monkeypatch.setattr(_executor, 'sys', SimpleNamespace(platform=platform))
+
+    if benign:
+        _executor._write_stdin(cast('BinaryIO', stream), b'input')
+    else:
+        with pytest.raises(OSError, match=error.strerror or '') as caught:
+            _executor._write_stdin(cast('BinaryIO', stream), b'input')
+        assert caught.value is error
+    assert stream.write_started.is_set()

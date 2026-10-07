@@ -29,11 +29,11 @@ absent by default. Set the host's outer timeout above the whole chain budget.
 Example:
 
 ```text
-sequential-hooks --agent codex --step-timeout 30 defsort hook --agent codex -- docwrap hook --agent codex
+sequential-hooks --agent codex --step-timeout 30 first-hook --agent codex -- second-hook --agent codex
 ```
 
-The two child `--agent codex` pairs belong to `defsort` and `docwrap`. The wrapper does not pass
-down or otherwise inherit its own `--agent` setting.
+The two child `--agent codex` pairs belong to `first-hook` and `second-hook`. The wrapper does not
+pass down or otherwise inherit its own `--agent` setting.
 
 ## Failure override
 
@@ -41,6 +41,10 @@ On pre-tool events, `--allow-on-failure` changes these failures from block to re
 not found, spawn, crash, timeout, stdout limit, output-worker join timeout, malformed output,
 unsupported output, oversized output, unavailable containment, and an unsupported executable. When
 a step never starts, the wrapper skips it. Post-tool already reports these failures and continues.
+
+On every event, the flag also allows a step to run without containment when containment setup
+fails. See the [containment failure override](../platforms.md#containment-failure-override) before
+enabling it.
 
 The flag does not weaken a valid native result, accept invalid host input, accept an event
 mismatch, relax an undeliverable decision-bearing mutation, override an interrupt, or recover an
@@ -77,9 +81,11 @@ Top-level `--help` and `--version` do not read stdin. Help exits zero and writes
 writes the installed distribution version to stdout and exits zero. If distribution metadata is
 unavailable, version writes a diagnostic to stderr and exits 2 without stdout. Hook-mode stdout
 carries only the host response. `doctor --help` and doctor reports also write text to stdout.
-Closed output pipes are absorbed without changing the command's exit status. Hook mode follows the
-native host response contract; handled native outcomes normally exit zero. A forwarded signal exits
-with 128 plus the signal number.
+Closed output pipes are absorbed without changing the command's exit status. If standard output is
+already closed when the wrapper starts, every mode writes one diagnostic line to stderr and exits 2
+before reading stdin, inspecting configuration, or running a step. Hook mode follows the native
+host response contract; handled native outcomes normally exit zero. A forwarded signal exits with
+128 plus the signal number.
 
 Failures follow three tiers. A functioning adapter translates child failures into its native
 response. A configuration error with a loaded host and a trusted event, including an invalid chain
@@ -90,8 +96,9 @@ Developer stderr supplies bounded diagnostic detail. When no functioning host ex
 `--agent` names an unknown, duplicated, unloadable, or outdated adapter, the required `--event` is
 missing or not served, malformed JSON prevents reading a payload event, a valid payload names no
 served event, the adapter malfunctions, or the host's configuration response itself fails, the
-wrapper writes nothing to stdout, one diagnostic line to stderr, and exits 2. Claude Code and Codex
-treat that exit as blocking; Antigravity does not.
+wrapper writes nothing to stdout, one diagnostic line to stderr, and exits 2. A hook started with
+standard output already closed takes the same last resort, because no response could reach the
+host. Claude Code and Codex treat that exit as blocking; Antigravity does not.
 
 `doctor` has a separate grammar:
 
@@ -105,9 +112,13 @@ For example, run `sequential-hooks doctor --agent claude` or its short equivalen
 Reports list configuration problems first, keep each hook's findings together in registration
 order, and finish with cross-hook findings.
 
-It exits 0 when findings are informational, 1 when at least one warning or error needs action, and
-2 for invalid invocation. Any agent name is accepted; an adapter that cannot be loaded is reported
-as the `host_unavailable` finding rather than an invocation error.
+It exits 0 when findings are informational, 1 when at least one warning or error is present, and 2
+for invalid invocation. Any agent name is accepted; an adapter that cannot be loaded is reported as
+the `host_unavailable` finding rather than an invocation error.
+
+Codex trust warnings persist after a hook is reviewed because `doctor` cannot inspect the host's
+saved trust decisions. Such warnings keep the exit status at 1; they do not establish that the hook
+remains untrusted. See the [Codex guide](../../plugins/codex/README.md#trust-and-verify).
 
 The `configuration sources:` section lists fixed candidate files and discovered drop-in files in
 inspection order. It does not list every directory examined during discovery. An unreadable drop-in
@@ -119,3 +130,9 @@ The report begins with `display: ASCII backslash escapes`. A displayed `\\` repr
 backslash. Control characters and non-ASCII code points use Python-style backslash escapes. Command
 values are bounded and secret-looking option values are redacted. `doctor` reads configuration and
 static platform capability only; it does not execute, edit, install, or grant trust.
+
+The wrapper executable and configuration-source path fields use forward slashes, including on
+Windows under Git Bash or PowerShell. Windows namespace paths retain their spelling, and POSIX
+filename backslashes retain the escaping described above. Command text and free-form findings keep
+their original values and existing escaping; these diagnostic representations are not shell
+commands to paste and execute.

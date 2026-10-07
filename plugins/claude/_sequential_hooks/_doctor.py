@@ -12,8 +12,10 @@ from sequential_hooks.hosts import (
     Finding,
     FindingSeverity,
     InspectedCommand,
+    JsonObject,
     JsonObjectExpectedError,
     JsonProtocolError,
+    JsonValue,
     LaunchSemantics,
     Registration,
     SourceKind,
@@ -163,7 +165,7 @@ def _finding(source: ConfigSource, code: str, message: str) -> Finding:
 
 def _disable_setting(
     source: ConfigSource,
-    loaded: dict[str, object] | None,
+    loaded: JsonObject | None,
 ) -> _DisableSetting:
     """Return the visible setting, finding, and whole-source rejection state."""
     if loaded is None or 'disableAllHooks' not in loaded:
@@ -181,7 +183,7 @@ def _disable_setting(
 
 def _hook_validation_finding(
     source: ConfigSource,
-    hook: object,
+    hook: JsonValue,
 ) -> Finding | None:
     """Return the first structural problem in one hook."""
     finding = None
@@ -192,7 +194,7 @@ def _hook_validation_finding(
             'contains a malformed hook',
         )
     else:
-        hook_data = cast('dict[str, object]', hook)
+        hook_data = hook
         if hook_data.get('type') != 'command':
             finding = _finding(
                 source,
@@ -207,7 +209,7 @@ def _hook_validation_finding(
             )
         elif 'args' in hook_data and (
             not isinstance(raw_args := hook_data['args'], list)
-            or not all(isinstance(argument, str) for argument in cast('list[object]', raw_args))
+            or not all(isinstance(argument, str) for argument in raw_args)
         ):
             finding = _finding(
                 source,
@@ -235,7 +237,7 @@ def _inspection_limitations() -> tuple[str, ...]:
     return _LIMITATIONS
 
 
-def _load_source(source: ConfigSource) -> tuple[dict[str, object] | None, Finding | None]:
+def _load_source(source: ConfigSource) -> tuple[JsonObject | None, Finding | None]:
     """Load one source without exposing content in diagnostics."""
     try:
         text = source.path.read_text(encoding='utf-8')
@@ -253,7 +255,7 @@ def _load_source(source: ConfigSource) -> tuple[dict[str, object] | None, Findin
         return None, _finding(source, 'claude_settings_malformed', 'must contain a JSON object')
     except JsonProtocolError:
         return None, _finding(source, 'claude_json_malformed', 'contains malformed JSON')
-    return cast('dict[str, object]', loaded), None
+    return loaded, None
 
 
 def _managed_directory(system_root: Path) -> Path:
@@ -309,7 +311,7 @@ def _registration(
     source: ConfigSource,
     event: str,
     matcher: str | None,
-    hook: object,
+    hook: JsonValue,
     *,
     enabled: bool | None,
 ) -> tuple[Registration | None, Finding | None]:
@@ -317,7 +319,7 @@ def _registration(
     validation_finding = _hook_validation_finding(source, hook)
     if validation_finding is not None:
         return None, validation_finding
-    hook_data = cast('dict[str, object]', hook)
+    hook_data = cast('JsonObject', hook)
     command = cast('str', hook_data.get('command'))
     raw_args = cast('list[str] | None', hook_data.get('args'))
     raw_timeout = hook_data.get('timeout')
@@ -337,7 +339,7 @@ def _registration(
         ),
         timeout=parse_timeout(raw_timeout, positive=False),
         enabled=enabled,
-        type=cast('str', hook_data['type']),
+        type='command',
     )
     if direct:
         return registration, None
@@ -362,17 +364,17 @@ def _registration(
 
 def _event_registrations(
     source: ConfigSource,
-    event: object,
-    groups: object,
+    event: str,
+    groups: JsonValue,
     *,
     enabled: bool | None,
 ) -> tuple[list[Registration], list[Finding]]:
     """Parse one event layer."""
-    if not isinstance(event, str) or not isinstance(groups, list):
+    if not isinstance(groups, list):
         return [], [_finding(source, 'claude_event_malformed', 'contains a malformed event')]
     registrations: list[Registration] = []
     findings: list[Finding] = []
-    for group in cast('list[object]', groups):
+    for group in groups:
         if not isinstance(group, dict):
             findings.append(
                 _finding(
@@ -380,21 +382,21 @@ def _event_registrations(
                 )
             )
             continue
-        group_data = cast('dict[str, object]', group)
+        group_data = group
         matcher = group_data.get('matcher')
         if 'matcher' in group_data and not isinstance(matcher, str):
             findings.append(
                 _finding(source, 'claude_matcher_malformed', 'contains a malformed matcher')
             )
             continue
-        parsed_matcher = cast('str | None', matcher)
+        parsed_matcher = matcher if isinstance(matcher, str) else None
         hooks = group_data.get('hooks')
         if not isinstance(hooks, list):
             findings.append(
                 _finding(source, 'claude_hooks_malformed', 'contains a malformed hooks list')
             )
             continue
-        for hook in cast('list[object]', hooks):
+        for hook in hooks:
             registration, finding = _registration(
                 source,
                 event,
@@ -403,6 +405,20 @@ def _event_registrations(
                 enabled=enabled,
             )
             if registration is not None:
+                if registration.enabled is None:
+                    registration = replace(
+                        registration,
+                        configuration_findings=(
+                            *registration.configuration_findings,
+                            Finding(
+                                FindingSeverity.WARNING,
+                                'enabled_unknown',
+                                'registration enabled state cannot be inspected statically',
+                                'Reconcile disableAllHooks values in the discovered '
+                                'Claude settings sources.',
+                            ),
+                        ),
+                    )
                 registrations.append(registration)
             if finding is not None:
                 findings.append(finding)
@@ -442,7 +458,7 @@ def _load_registrations(
                 _finding(source, 'claude_hooks_malformed', 'contains a malformed hooks object')
             )
             continue
-        hook_events = cast('dict[str, object]', hooks)
+        hook_events = hooks
         for event, groups in hook_events.items():
             event_registrations, event_findings = _event_registrations(
                 source,

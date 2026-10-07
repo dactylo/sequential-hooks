@@ -1,13 +1,13 @@
 # Codex
 
-Use `sequential-hooks` for Codex `PreToolUse` and `PostToolUse` command hooks. Codex discovers
+Use sequential-hooks for Codex `PreToolUse` and `PostToolUse` command hooks. Codex discovers
 `hooks.json` and inline `[hooks]` tables in `config.toml` at these local paths:
 
 - User: `~/.codex/hooks.json` and `~/.codex/config.toml`.
 - System: `/etc/codex/hooks.json` and `/etc/codex/config.toml`.
 - Each project layer: `.codex/hooks.json` and `.codex/config.toml`.
 
-`sequential-hooks` has no configuration file.
+sequential-hooks has no configuration file.
 
 Official reference: [Codex hooks](https://learn.chatgpt.com/docs/hooks).
 
@@ -105,6 +105,10 @@ Common findings:
 
 `doctor` cannot establish active profiles, session overrides, plugin hooks, persisted trust, cloud
 or MDM hooks, managed `requirements.toml` constraints, or the effect of `allow_managed_hooks_only`.
+
+The trust warnings persist after approval through `/hooks` because `doctor` cannot read those saved
+decisions. These warnings keep its exit status at 1; they do not mean that approval failed or that
+you must approve the hook again.
 
 ## Configuration failures
 

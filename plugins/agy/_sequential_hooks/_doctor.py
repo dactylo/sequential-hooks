@@ -9,8 +9,10 @@ from sequential_hooks.hosts import (
     Finding,
     FindingSeverity,
     InspectedCommand,
+    JsonObject,
     JsonObjectExpectedError,
     JsonProtocolError,
+    JsonValue,
     LaunchSemantics,
     Registration,
     SourceKind,
@@ -177,12 +179,12 @@ def _finding(
 
 def _handler_validation_finding(
     source: ConfigSource,
-    handler: object,
+    handler: JsonValue,
 ) -> Finding | None:
     """Return the first structural problem in one handler."""
     if not isinstance(handler, dict):
         return _finding(source, 'agy_hook_malformed', 'contains a malformed hook handler')
-    handler_data = cast('dict[str, object]', handler)
+    handler_data = handler
     handler_type = handler_data.get('type', 'command')
     if handler_type != 'command':
         return _finding(
@@ -198,7 +200,7 @@ def _handler_validation_finding(
         )
     if 'args' in handler_data and (
         not isinstance(raw_args := handler_data['args'], list)
-        or not all(isinstance(argument, str) for argument in cast('list[object]', raw_args))
+        or not all(isinstance(argument, str) for argument in raw_args)
     ):
         return _finding(
             source,
@@ -219,7 +221,7 @@ def _inspection_limitations() -> tuple[str, ...]:
     return _LIMITATIONS
 
 
-def _load_source(source: ConfigSource) -> tuple[dict[str, object] | None, Finding | None]:
+def _load_source(source: ConfigSource) -> tuple[JsonObject | None, Finding | None]:
     """Load one strict JSON source without exposing its content."""
     try:
         text = source.path.read_text(encoding='utf-8')
@@ -237,14 +239,14 @@ def _load_source(source: ConfigSource) -> tuple[dict[str, object] | None, Findin
         return None, _finding(source, 'agy_settings_malformed', 'must contain a JSON object')
     except JsonProtocolError:
         return None, _finding(source, 'agy_json_malformed', 'contains malformed JSON')
-    return cast('dict[str, object]', loaded), None
+    return loaded, None
 
 
 def _registration(
     source: ConfigSource,
     event: str,
     matcher: str | None,
-    handler: object,
+    handler: JsonValue,
     *,
     enabled: bool | None,
 ) -> tuple[Registration | None, list[Finding]]:
@@ -252,7 +254,7 @@ def _registration(
     validation_finding = _handler_validation_finding(source, handler)
     if validation_finding is not None:
         return None, [validation_finding]
-    handler_data = cast('dict[str, object]', handler)
+    handler_data = cast('JsonObject', handler)
     raw_args = cast('list[str] | None', handler_data.get('args'))
     raw_timeout = handler_data.get('timeout')
     timeout = _DEFAULT_HANDLER_TIMEOUT
@@ -291,7 +293,7 @@ def _registration(
         windows_launch_semantics=LaunchSemantics.WINDOWS_SHELL,
         timeout=timeout,
         enabled=enabled,
-        type=cast('str', handler_data.get('type', 'command')),
+        type='command',
         configuration_findings=tuple(findings),
     )
     return registration, []
@@ -299,17 +301,17 @@ def _registration(
 
 def _event_registrations(
     source: ConfigSource,
-    event: object,
-    groups: object,
+    event: str,
+    groups: JsonValue,
     *,
     enabled: bool | None,
 ) -> tuple[list[Registration], list[Finding]]:
     """Parse one event layer."""
-    if not isinstance(event, str) or not isinstance(groups, list):
+    if not isinstance(groups, list):
         return [], [_finding(source, 'agy_event_malformed', 'contains a malformed event')]
     registrations: list[Registration] = []
     findings: list[Finding] = []
-    for group in cast('list[object]', groups):
+    for group in groups:
         if not isinstance(group, dict):
             findings.append(
                 _finding(
@@ -319,7 +321,7 @@ def _event_registrations(
                 )
             )
             continue
-        group_data = cast('dict[str, object]', group)
+        group_data = group
         matcher = group_data.get('matcher')
         if 'matcher' in group_data and not isinstance(matcher, str):
             findings.append(
@@ -336,7 +338,7 @@ def _event_registrations(
                 )
             )
             continue
-        for handler in cast('list[object]', handlers):
+        for handler in handlers:
             registration, handler_findings = _registration(
                 source,
                 event,
@@ -352,7 +354,7 @@ def _event_registrations(
 
 def _named_registrations(
     source: ConfigSource,
-    loaded: dict[str, object],
+    loaded: JsonObject,
 ) -> tuple[list[Registration], list[Finding]]:
     """Parse the documented named-hook map."""
     registrations: list[Registration] = []
@@ -367,7 +369,7 @@ def _named_registrations(
                 )
             )
             continue
-        hook_data = cast('dict[str, object]', named_hook)
+        hook_data = named_hook
         enabled = hook_data.get('enabled', True)
         if not isinstance(enabled, bool):
             findings.append(

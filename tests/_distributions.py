@@ -11,6 +11,7 @@ BUILTIN_ENTRY_POINTS = _plugin_entry_points(Path(__file__).resolve().parent.pare
     'sequential_hooks.hosts'
 ]
 _ENTRY_POINT_GROUP = 'sequential_hooks.hosts'
+_HOSTS = Path(tempfile.mkdtemp(prefix='sequential-hooks-hosts-'))
 _SRC_ROOT = Path(__file__).resolve().parent.parent / 'src'
 _TESTS_ROOT = Path(__file__).resolve().parent.parent
 
@@ -35,6 +36,5 @@ def subprocess_environment(*extra_roots: Path) -> dict[str, str]:
     return {**os.environ, 'PYTHONPATH': os.pathsep.join(str(root) for root in roots)}
 
 
-_HOSTS = Path(tempfile.mkdtemp(prefix='sequential-hooks-hosts-'))
 atexit.register(shutil.rmtree, _HOSTS, ignore_errors=True)
 register_distribution(_HOSTS, 'sequential-hooks', BUILTIN_ENTRY_POINTS)

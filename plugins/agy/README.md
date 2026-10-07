@@ -1,7 +1,7 @@
 # Antigravity
 
 The Antigravity adapter chains `PreToolUse` and `PostToolUse` hooks. Antigravity may invoke an
-exact post-tool matcher for extra callbacks whose `toolCall` is explicitly null. `sequential-hooks`
+exact post-tool matcher for extra callbacks whose `toolCall` is explicitly null. sequential-hooks
 treats that exact shape as inapplicable, starts no child step, and returns the native empty
 response.
 
@@ -10,7 +10,7 @@ Antigravity CLI 1.1.13 documents five native hook events: `PreToolUse`, `PostToo
 `PostToolUse`.
 
 Antigravity configuration may appear in `~/.gemini/config/hooks.json` or project
-`.agents/hooks.json`. `sequential-hooks` has no configuration file.
+`.agents/hooks.json`. sequential-hooks has no configuration file.
 
 Official reference: [Antigravity hooks](https://antigravity.google/docs/hooks).
 

@@ -3,7 +3,6 @@
 import json
 import subprocess
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -19,25 +18,22 @@ from sequential_hooks._registry import load_host
 from sequential_hooks.hosts import (
     Finding,
     FindingSeverity,
+    JsonValue,
     LaunchSemantics,
     SourceKind,
 )
 
-_MALFORMED_HOOKS_NAME_CASES = cast(
-    'tuple[tuple[object, str], ...]',
-    (
-        ([], 'agy_named_hook_malformed'),
-        ({'PreToolUse': {}}, 'agy_event_malformed'),
-        ({'PreToolUse': [None]}, 'agy_matcher_group_malformed'),
-        ({'PreToolUse': [{'matcher': None, 'hooks': []}]}, 'agy_matcher_malformed'),
-        ({'PreToolUse': [{}]}, 'agy_handler_list_malformed'),
-    ),
+_MALFORMED_HOOKS_NAME_CASES: tuple[tuple[JsonValue, str], ...] = (
+    ([], 'agy_named_hook_malformed'),
+    ({'PreToolUse': {}}, 'agy_event_malformed'),
+    ({'PreToolUse': [None]}, 'agy_matcher_group_malformed'),
+    ({'PreToolUse': [{'matcher': None, 'hooks': []}]}, 'agy_matcher_malformed'),
+    ({'PreToolUse': [{}]}, 'agy_handler_list_malformed'),
 )
 
 
-def _non_global_codes(findings: object) -> list[str]:
-    typed = cast('tuple[Finding, ...]', findings)
-    return [finding.code for finding in typed]
+def _non_global_codes(findings: tuple[Finding, ...]) -> list[str]:
+    return [finding.code for finding in findings]
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -380,6 +376,7 @@ def test_duplicate_literal_options_remain_uninspectable(
     assert 'wrong_host' not in codes
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_dynamic_command_has_no_malformed_wrapper_warning(tmp_path: Path) -> None:
     _write_hook_named_hooks(
         tmp_path / '.gemini/config/hooks.json',
@@ -665,6 +662,7 @@ def test_named_hooks_preserve_mixed_source_order(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('command', 'event', 'expected_code'),
     [
@@ -716,6 +714,7 @@ def test_shell_command_checks_registered_wrapper_event(
         assert expected_code in codes
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('command', 'expected_code'),
     [
@@ -769,6 +768,7 @@ def test_shell_command_preserves_safe_host_diagnoses(
     assert matching[0].correction == 'Use --agent agy.'
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_stop_wrappers_report_only_unservable_native_event(tmp_path: Path) -> None:
     source = tmp_path / '.gemini/config/hooks.json'
     _write_hook_named_hooks(

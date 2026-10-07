@@ -69,13 +69,8 @@ _PRE_HOOK_FIELDS = frozenset(
 )
 
 
-class ClaudeAdapter(Composer):
-    """Compose child results for one validated Claude Code event.
-
-    Child results are consumed in step order. Accepted mutations update the
-    event-owned field supplied to later children, and finalization emits the
-    composed native response.
-    """
+class _ClaudeAdapter(Composer):
+    """Compose child results for one validated Claude Code event."""
 
     field_limit = _CLAUDE_FIELD_LIMIT_CHARACTERS
 
@@ -87,18 +82,7 @@ class ClaudeAdapter(Composer):
         *,
         allow_on_failure: bool,
     ) -> None:
-        """Validate native input and initialize one Claude Code event adapter.
-
-        Args:
-            raw_input: Original strict JSON bytes received from Claude Code.
-            payload: Decoded strict JSON object matching `raw_input`.
-            diagnostics: Developer-tier diagnostic sink.
-            allow_on_failure: Whether approved pre-tool failures may continue.
-
-        Raises:
-            HostInputError: If required Claude Code input is missing or
-                invalid, or the payload nests too deeply to compose.
-        """
+        """Validate native input and initialize one Claude Code event adapter."""
         event = payload.get('hook_event_name')
         if event not in _EVENTS:
             raise HostInputError('Claude Code input has an unsupported hook event')
@@ -400,7 +384,7 @@ class ClaudeHost:
         diagnostics: Diagnostics,
         *,
         allow_on_failure: bool,
-    ) -> ClaudeAdapter:
+    ) -> _ClaudeAdapter:
         """Validate native input and construct the adapter for one invocation.
 
         Args:
@@ -416,7 +400,9 @@ class ClaudeHost:
         Raises:
             HostInputError: If the payload is not valid input for `event`.
         """
-        adapter = ClaudeAdapter(raw_input, payload, diagnostics, allow_on_failure=allow_on_failure)
+        adapter = _ClaudeAdapter(
+            raw_input, payload, diagnostics, allow_on_failure=allow_on_failure
+        )
         if adapter.event != event:
             raise HostInputError('Claude Code input event does not match the selected event')
         return adapter

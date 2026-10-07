@@ -10,7 +10,7 @@ The wrapper and every step therefore:
 - receive the host's inherited working directory and environment; and
 - must be trusted before registration.
 
-`sequential-hooks` does not sandbox, reduce privileges, inspect step intent, or prompt before
+sequential-hooks does not sandbox, reduce privileges, inspect step intent, or prompt before
 starting a step. Direct argument execution prevents shell reinterpretation inside the wrapper; it
 does not make an untrusted command safe. A host-level command string still follows that host's
 shell and quoting rules.

@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from plugins.agy._sequential_hooks import _adapter as agy_module
-from plugins.agy._sequential_hooks._adapter import AgyAdapter, AgyHost
+from plugins.agy._sequential_hooks._adapter import AgyHost, _AgyAdapter
 from sequential_hooks._diagnostics import Diagnostics
 from sequential_hooks._executor import _STDOUT_LIMIT_BYTES
 from sequential_hooks._types import (
@@ -42,7 +42,7 @@ _PRE_RANK = {
 _UNCONTAINED_WARNING = 'step ran without containment; descendant cleanup is not guaranteed'
 
 
-class _OutputFailureAdapter(AgyAdapter):
+class _OutputFailureAdapter(_AgyAdapter):
     def consume_output_failure(
         self,
         step: Step,
@@ -65,11 +65,11 @@ def _adapter(
     raw_input: bytes | None = None,
     *,
     allow_on_failure: bool = False,
-) -> tuple[AgyAdapter, io.StringIO]:
+) -> tuple[_AgyAdapter, io.StringIO]:
     data = _fixture(event) if raw_input is None else raw_input
     stream = io.StringIO()
     return (
-        AgyAdapter(
+        _AgyAdapter(
             event,
             data,
             load_object(data),
@@ -105,7 +105,7 @@ def _output_failure_adapter(
     )
 
 
-def _response(adapter: AgyAdapter) -> JsonObject:
+def _response(adapter: _AgyAdapter) -> JsonObject:
     return load_object(adapter.finalize().stdout)
 
 
@@ -129,6 +129,30 @@ def test_all_neutral_chain_emits_canonical_allow() -> None:
     adapter.consume(_step(2), _output({'decision': 'neutral'}))
 
     assert adapter.finalize().stdout == b'{"decision":"allow"}\n'
+
+
+@pytest.mark.parametrize('event', ['PreToolUse', 'PostToolUse'])
+def test_configuration_response_is_independent_of_adapter_construction(
+    event: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError('configuration response must not construct an adapter')
+
+    monkeypatch.setattr('plugins.agy._sequential_hooks._adapter._AgyAdapter', unavailable)
+    monkeypatch.setattr(AgyHost, 'adapter', unavailable)
+    stream = io.StringIO()
+    response = AgyHost().configuration_response(
+        event, 'invalid configuration', Diagnostics(stream)
+    )
+    message = '[step 1: configuration]\nspawn: sequential-hooks could not safely run this hook'
+    expected = {'decision': 'deny', 'reason': message} if event == 'PreToolUse' else {}
+
+    assert response.exit_code == 0
+    assert json.loads(response.stdout) == expected
+    assert response.stdout.endswith(b'\n')
+    assert response.stdout.count(b'\n') == 1
+    assert 'sequential-hooks could not safely run this hook' in stream.getvalue()
 
 
 def test_conflicting_winning_overrides_become_terminal_deny() -> None:
@@ -419,7 +443,7 @@ def test_lone_surrogate_uncontained_failure_restores_exact_prior_state() -> None
     raw_input = _fixture('PreToolUse')
     payload = load_object(raw_input)
     stream = io.StringIO()
-    adapter = AgyAdapter(
+    adapter = _AgyAdapter(
         'PreToolUse',
         raw_input,
         payload,
@@ -1210,27 +1234,3 @@ def test_whitespace_only_stdout_is_neutral(stdout: bytes) -> None:
     assert control == 'continue'
     assert adapter.finalize().stdout == b'{"decision":"allow"}\n'
     assert stream.getvalue() == ''
-
-
-@pytest.mark.parametrize('event', ['PreToolUse', 'PostToolUse'])
-def test_configuration_response_is_independent_of_adapter_construction(
-    event: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def unavailable(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError('configuration response must not construct an adapter')
-
-    monkeypatch.setattr('plugins.agy._sequential_hooks._adapter.AgyAdapter', unavailable)
-    monkeypatch.setattr(AgyHost, 'adapter', unavailable)
-    stream = io.StringIO()
-    response = AgyHost().configuration_response(
-        event, 'invalid configuration', Diagnostics(stream)
-    )
-    message = '[step 1: configuration]\nspawn: sequential-hooks could not safely run this hook'
-    expected = {'decision': 'deny', 'reason': message} if event == 'PreToolUse' else {}
-
-    assert response.exit_code == 0
-    assert json.loads(response.stdout) == expected
-    assert response.stdout.endswith(b'\n')
-    assert response.stdout.count(b'\n') == 1
-    assert 'sequential-hooks could not safely run this hook' in stream.getvalue()

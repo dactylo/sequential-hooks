@@ -39,6 +39,7 @@ class UncontainedBackend:
 
         Raises:
             ContainmentError: If fallback was not explicitly allowed.
+            OSError: If starting the process fails.
         """
         if not allow_uncontained:
             raise ContainmentError('uncontained execution requires an explicit override')
@@ -63,6 +64,7 @@ class UncontainedBackend:
 
         Raises:
             ContainmentError: If fallback was not explicitly allowed.
+            OSError: If starting the process fails.
         """
         del failed
         return self.start(step, allow_uncontained=allow_uncontained)

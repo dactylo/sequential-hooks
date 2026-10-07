@@ -33,11 +33,13 @@ from sequential_hooks._executor import (
     ForwardedSignal,
     ProcessExecutor,
 )
-from sequential_hooks._types import ContainmentState, FailureKind, Step, StepResult
+from sequential_hooks._types import ContainmentState, FailureKind, Step
 from tests._helpers import (
     CHILD_TIMEOUT_SECONDS,
     PROCESS_GROUP_FLAGS,
+    FixtureResult,
     finish_process,
+    fixture_result,
     process_transcript,
     run_setup,
     step_transcript,
@@ -185,24 +187,23 @@ def _run_delayed_fixture(
     diagnostics: Diagnostics | None = None,
     startup_delay: float,
     timeout: float,
-) -> StepResult:
-    return ProcessExecutor(diagnostics or Diagnostics(StringIO())).run(
-        Step(
-            1,
-            (
-                sys.executable,
-                '-c',
-                _DELAYED_FIXTURE_CODE,
-                str(startup_delay),
-                str(_FIXTURE),
-                mode,
-                *args,
-            ),
-        ),
+) -> FixtureResult:
+    command = (
+        sys.executable,
+        '-c',
+        _DELAYED_FIXTURE_CODE,
+        str(startup_delay),
+        str(_FIXTURE),
+        mode,
+        *args,
+    )
+    result = ProcessExecutor(diagnostics or Diagnostics(StringIO())).run(
+        Step(1, command),
         b'{}\n',
         timeout,
         allow_uncontained=False,
     )
+    return fixture_result(result, command)
 
 
 def _run_fixture(
@@ -211,13 +212,15 @@ def _run_fixture(
     diagnostics: Diagnostics | None = None,
     input_bytes: bytes = b'{}\n',
     timeout: float | None = CHILD_TIMEOUT_SECONDS,
-) -> StepResult:
-    return ProcessExecutor(diagnostics or Diagnostics(StringIO())).run(
-        Step(1, (sys.executable, str(_FIXTURE), mode, *args)),
+) -> FixtureResult:
+    command = (sys.executable, str(_FIXTURE), mode, *args)
+    result = ProcessExecutor(diagnostics or Diagnostics(StringIO())).run(
+        Step(1, command),
         input_bytes,
         timeout,
         allow_uncontained=False,
     )
+    return fixture_result(result, command)
 
 
 def _windows_error(error_code: int) -> OSError:
@@ -322,11 +325,7 @@ def test_native_job_closes_inherited_output_after_leader_exit(recorded_tree: Pat
     record = recorded_tree
     started = time.monotonic()
     result = _run_fixture('child-tree-exit', '10', str(record), diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(sys.executable, str(_FIXTURE), 'child-tree-exit', '10', str(record)),
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
     elapsed = time.monotonic() - started
     assert result.returncode == 0, result_transcript
     assert elapsed < 3.0, result_transcript
@@ -350,18 +349,7 @@ def test_native_job_terminates_descendants_on_bounded_stop_output_limit(
         timeout=10.0,
         diagnostics=Diagnostics(stream),
     )
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(
-            sys.executable,
-            str(_FIXTURE),
-            'child-tree-output',
-            '10',
-            str(record),
-            str(_STDOUT_LIMIT_BYTES + 1),
-        ),
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
     elapsed = time.monotonic() - started
     assert elapsed < 15.0, result_transcript
     assert Path(f'{record}.published').exists(), result_transcript
@@ -394,29 +382,12 @@ def test_native_job_terminates_descendants_on_bounded_stop_timeout(
             timeout=0.2,
             diagnostics=Diagnostics(stream),
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(
-                sys.executable,
-                '-c',
-                _DELAYED_FIXTURE_CODE,
-                str(startup_delay),
-                str(_FIXTURE),
-                'child-tree',
-                '10',
-                str(record),
-            ),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
     else:
         result = _run_fixture(
             'child-tree', '10', str(record), timeout=0.2, diagnostics=Diagnostics(stream)
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(sys.executable, str(_FIXTURE), 'child-tree', '10', str(record)),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
     elapsed = time.monotonic() - started
     assert elapsed < 15.0, result_transcript
     assert not clock.readiness_timed_out, result_transcript
@@ -476,11 +447,7 @@ def test_native_launcher_preserves_spaces_non_ascii_paths_argv_and_lf(
 def test_native_launcher_relays_every_unsigned_exit(value: int) -> None:
     stream = StringIO()
     result = _run_fixture('windows-exit', hex(value), diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result,
-        stream.getvalue(),
-        command=(sys.executable, str(_FIXTURE), 'windows-exit', hex(value)),
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
     assert result.returncode == value, result_transcript
 
 
@@ -488,9 +455,7 @@ def test_native_launcher_transports_hook_payload_and_output() -> None:
     stream = StringIO()
     payload = b'{"native":"payload"}\n'
     result = _run_fixture('echo-input', input_bytes=payload, diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'echo-input')
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.returncode == 0, result_transcript
     assert result.stdout == payload, result_transcript

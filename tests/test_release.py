@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import pytest
 
-_WORKFLOW = Path(__file__).parents[1] / '.github' / 'workflows' / 'release.yml'
 _COMMIT = 'a' * 40
 _RUN_URL = 'https://example.test/actions/runs/42'
+_WORKFLOW = Path(__file__).parents[1] / '.github' / 'workflows' / 'release.yml'
 
 
 def _verifier() -> str:

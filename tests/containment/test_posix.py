@@ -16,11 +16,13 @@ from sequential_hooks._containment import ManagedStep, _posix
 from sequential_hooks._containment._posix import PosixBackend, _PosixManagedStep
 from sequential_hooks._diagnostics import Diagnostics
 from sequential_hooks._executor import ForwardedSignal, ProcessExecutor
-from sequential_hooks._types import ContainmentState, FailureKind, Step, StepResult
+from sequential_hooks._types import ContainmentState, FailureKind, Step
 from tests._helpers import (
     CHILD_TIMEOUT_SECONDS,
     PROCESS_GROUP_FLAGS,
+    FixtureResult,
     finish_process,
+    fixture_result,
     step_transcript,
 )
 
@@ -158,13 +160,15 @@ def _run_fixture(
     *args: str,
     diagnostics: Diagnostics | None = None,
     timeout: float | None = CHILD_TIMEOUT_SECONDS,
-) -> StepResult:
-    return ProcessExecutor(diagnostics or Diagnostics(StringIO())).run(
-        Step(1, (sys.executable, str(_FIXTURE), mode, *args)),
+) -> FixtureResult:
+    command = (sys.executable, str(_FIXTURE), mode, *args)
+    result = ProcessExecutor(diagnostics or Diagnostics(StringIO())).run(
+        Step(1, command),
         b'{}\n',
         timeout,
         allow_uncontained=False,
     )
+    return fixture_result(result, command)
 
 
 def _wait_for_missing(pids: list[int]) -> list[int]:
@@ -198,8 +202,8 @@ def test_backend_preserves_literal_argv_and_disables_shell(
 ) -> None:
     stream = StringIO()
     real_popen = subprocess.Popen
-    popen_args: tuple[Any, ...] | None = None
-    popen_kwargs: dict[str, Any] = {}
+    popen_args: tuple[object, ...] | None = None
+    popen_kwargs: dict[str, object] = {}
 
     def recording_popen(
         *args: Any,  # noqa: ANN401 - Forward the overloaded `subprocess.Popen` boundary.
@@ -214,9 +218,7 @@ def test_backend_preserves_literal_argv_and_disables_shell(
     argv = ('space value', '*', '$HOME', '`uname`', '; touch nope', '--check')
 
     result = _run_fixture('show-argv', *argv, diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'show-argv', *argv)
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     assert json.loads(result.stdout) == list(argv), result_transcript
@@ -236,219 +238,12 @@ def test_backend_preserves_literal_argv_and_disables_shell(
 def test_backend_starts_step_in_new_session() -> None:
     stream = StringIO()
     result = _run_fixture('report-process', diagnostics=Diagnostics(stream))
-    result_transcript = step_transcript(
-        result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'report-process')
-    )
+    result_transcript = step_transcript(result, stream.getvalue())
 
     assert result.failure is None, result_transcript
     process_ids = json.loads(result.stdout)
     assert result.containment is ContainmentState.CONTAINED, result_transcript
     assert process_ids['pid'] == process_ids['pgid'] == process_ids['sid'], result_transcript
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_signal_group_waits_for_exiting_leader_before_retry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    process = _SignalProcess(None)
-    attempts = 0
-
-    def exiting_then_signalable(_pgid: int, _signum: int) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise PermissionError('zombie-only group')
-        assert process.poll_calls == 1
-        assert process.wait_timeouts == [8.0]
-
-    monkeypatch.setattr(managed, '_process', process, raising=False)
-    monkeypatch.setattr(_posix.os, 'killpg', exiting_then_signalable)
-    monkeypatch.setattr(_posix.time, 'monotonic', lambda: 12.0)
-
-    managed._signal_group(signal.SIGTERM, 20.0)
-
-    assert process.poll_calls == 1
-    assert process.wait_timeouts == [8.0]
-    assert attempts == 2
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_signal_group_preserves_exact_group_and_signal_on_retry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    if sys.platform == 'win32':
-        pytest.skip('POSIX containment requires POSIX')
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    process = _SignalProcess(0)
-    calls: list[tuple[int, int]] = []
-
-    def record_signal(pgid: int, signum: int) -> None:
-        calls.append((pgid, signum))
-        if len(calls) == 1:
-            raise PermissionError('zombie-only group')
-        assert process.poll_calls == 1
-
-    monkeypatch.setattr(managed, '_process', process, raising=False)
-    monkeypatch.setattr(_posix.os, 'killpg', record_signal)
-
-    managed._signal_group(signal.SIGKILL, 20.0)
-
-    assert calls == [(12345, signal.SIGKILL), (12345, signal.SIGKILL)]
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_signal_group_preserves_permission_denial_after_reap_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    process = _SignalProcess(
-        None,
-        wait_error=subprocess.TimeoutExpired('exiting-child', 0.0),
-    )
-    error = PermissionError('live group denied')
-    attempts = 0
-
-    def deny_signal(_pgid: int, _signum: int) -> None:
-        nonlocal attempts
-        attempts += 1
-        raise error
-
-    monkeypatch.setattr(managed, '_process', process, raising=False)
-    monkeypatch.setattr(_posix.os, 'killpg', deny_signal)
-    monkeypatch.setattr(_posix.time, 'monotonic', lambda: 20.0)
-
-    with pytest.raises(PermissionError) as raised:
-        managed._signal_group(signal.SIGTERM, 20.0)
-
-    assert raised.value is error
-    assert process.poll_calls == 1
-    assert process.wait_timeouts == [0.0]
-    assert attempts == 1
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_signal_group_propagates_repeated_permission_denial(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    process = _SignalProcess(0)
-    errors = iter(
-        (
-            PermissionError('zombie-only group'),
-            PermissionError('surviving group denied'),
-        )
-    )
-
-    def deny_signal(_pgid: int, _signum: int) -> None:
-        raise next(errors)
-
-    monkeypatch.setattr(managed, '_process', process, raising=False)
-    monkeypatch.setattr(_posix.os, 'killpg', deny_signal)
-
-    with pytest.raises(PermissionError, match='surviving group denied'):
-        managed._signal_group(signal.SIGTERM, 20.0)
-
-    assert process.poll_calls == 1
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_signal_group_suppresses_vanished_group_after_reaping_leader(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    process = _SignalProcess(0)
-    errors = iter((PermissionError('zombie-only group'), ProcessLookupError('vanished')))
-    attempts = 0
-
-    def deny_then_vanish(_pgid: int, _signum: int) -> None:
-        nonlocal attempts
-        attempts += 1
-        raise next(errors)
-
-    monkeypatch.setattr(managed, '_process', process, raising=False)
-    monkeypatch.setattr(_posix.os, 'killpg', deny_then_vanish)
-
-    managed._signal_group(signal.SIGTERM, 20.0)
-
-    assert process.poll_calls == 1
-    assert attempts == 2
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_forward_signal_bounds_exiting_leader_recovery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    process = _SignalProcess(
-        None,
-        wait_error=subprocess.TimeoutExpired('exiting-child', 0.25),
-    )
-    error = PermissionError('exiting group denied')
-    monotonic_values = iter((10.0, 10.25))
-
-    def deny_signal(_pgid: int, _signum: int) -> None:
-        raise error
-
-    monkeypatch.setattr(managed, '_process', process, raising=False)
-    monkeypatch.setattr(managed, '_graceful_signum', None, raising=False)
-    monkeypatch.setattr(_posix, '_FORCE_KILL_WAIT_SECONDS', 0.5)
-    monkeypatch.setattr(_posix.os, 'killpg', deny_signal)
-    monkeypatch.setattr(_posix.time, 'monotonic', lambda: next(monotonic_values))
-
-    with pytest.raises(PermissionError) as raised:
-        managed.forward_signal(signal.SIGINT)
-
-    assert raised.value is error
-    assert managed._graceful_signum == signal.SIGINT
-    assert process.wait_timeouts == [0.25]
-
-
-@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
-def test_terminate_tree_shares_each_phase_deadline_with_signaling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    if sys.platform == 'win32':
-        pytest.skip('POSIX containment requires POSIX')
-    managed = _PosixManagedStep.__new__(_PosixManagedStep)
-    events: list[tuple[str, float] | tuple[str, int, float]] = []
-    group_results = iter((False, True))
-    monotonic_values = iter((10.0, 20.0))
-
-    def monotonic() -> float:
-        value = next(monotonic_values)
-        events.append(('clock', value))
-        return value
-
-    def signal_group(signum: int, deadline: float) -> None:
-        events.append(('signal', signum, deadline))
-
-    def wait_for_group_exit(deadline: float) -> bool:
-        events.append(('group', deadline))
-        return next(group_results)
-
-    def wait_for_process_reap(deadline: float) -> bool:
-        events.append(('reap', deadline))
-        return True
-
-    monkeypatch.setattr(managed, '_graceful_signum', None, raising=False)
-    monkeypatch.setattr(managed, '_signal_group', signal_group, raising=False)
-    monkeypatch.setattr(managed, '_wait_for_group_exit', wait_for_group_exit, raising=False)
-    monkeypatch.setattr(managed, '_wait_for_process_reap', wait_for_process_reap, raising=False)
-    monkeypatch.setattr(_posix, '_FORCE_KILL_WAIT_SECONDS', 0.5)
-    monkeypatch.setattr(_posix.time, 'monotonic', monotonic)
-
-    managed.terminate_tree(2.0)
-
-    assert events == [
-        ('clock', 10.0),
-        ('signal', signal.SIGTERM, 12.0),
-        ('group', 12.0),
-        ('clock', 20.0),
-        ('signal', signal.SIGKILL, 20.5),
-        ('group', 20.5),
-        ('reap', 20.5),
-    ]
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
@@ -473,11 +268,7 @@ def test_executor_cleans_group_after_leader_exits(tmp_path: Path) -> None:
         result = _run_fixture(
             'child-tree-exit', '10', str(pid_file), timeout=None, diagnostics=Diagnostics(stream)
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(sys.executable, str(_FIXTURE), 'child-tree-exit', '10', str(pid_file)),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
         pids = [int(value) for value in json.loads(pid_file.read_text()).values()]
         remaining = [pid for pid in pids if _pid_exists(pid)]
     finally:
@@ -522,11 +313,7 @@ def test_executor_timeout_leaves_no_original_group_member(
         result = _run_fixture(
             'child-tree', '10', str(pid_file), timeout=0.5, diagnostics=Diagnostics(stream)
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(sys.executable, str(_FIXTURE), 'child-tree', '10', str(pid_file)),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
         pids = [int(value) for value in json.loads(pid_file.read_text()).values()]
         remaining = [pid for pid in pids if _pid_exists(pid)]
     finally:
@@ -540,6 +327,35 @@ def test_executor_timeout_leaves_no_original_group_member(
     assert result.failure is not None, result_transcript
     assert result.failure.kind is FailureKind.TIMEOUT, result_transcript
     assert remaining == [], result_transcript
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_forward_signal_bounds_exiting_leader_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    process = _SignalProcess(
+        None,
+        wait_error=subprocess.TimeoutExpired('exiting-child', 0.25),
+    )
+    error = PermissionError('exiting group denied')
+    monotonic_values = iter((10.0, 10.25))
+
+    def deny_signal(_pgid: int, _signum: int) -> None:
+        raise error
+
+    monkeypatch.setattr(managed, '_process', process, raising=False)
+    monkeypatch.setattr(managed, '_graceful_signum', None, raising=False)
+    monkeypatch.setattr(_posix, '_FORCE_KILL_WAIT_SECONDS', 0.5)
+    monkeypatch.setattr(_posix.os, 'killpg', deny_signal)
+    monkeypatch.setattr(_posix.time, 'monotonic', lambda: next(monotonic_values))
+
+    with pytest.raises(PermissionError) as raised:
+        managed.forward_signal(signal.SIGINT)
+
+    assert raised.value is error
+    assert managed._graceful_signum == signal.SIGINT
+    assert process.wait_timeouts == [0.25]
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
@@ -675,11 +491,7 @@ def test_process_leaving_original_group_is_an_explicit_exclusion(
         result = _run_fixture(
             mode, '10', str(pid_file), timeout=0.5, diagnostics=Diagnostics(stream)
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(sys.executable, str(_FIXTURE), mode, '10', str(pid_file)),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
         pids = json.loads(pid_file.read_text())
         escaped_pid = int(pids['escaped'])
         assert result.failure is not None, result_transcript
@@ -740,6 +552,182 @@ def test_signal_context_forwards_actual_signal_and_cleans_child(tmp_path: Path) 
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_signal_group_preserves_exact_group_and_signal_on_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform == 'win32':
+        pytest.skip('POSIX containment requires POSIX')
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    process = _SignalProcess(0)
+    calls: list[tuple[int, int]] = []
+
+    def record_signal(pgid: int, signum: int) -> None:
+        calls.append((pgid, signum))
+        if len(calls) == 1:
+            raise PermissionError('zombie-only group')
+        assert process.poll_calls == 1
+
+    monkeypatch.setattr(managed, '_process', process, raising=False)
+    monkeypatch.setattr(_posix.os, 'killpg', record_signal)
+
+    managed._signal_group(signal.SIGKILL, 20.0)
+
+    assert calls == [(12345, signal.SIGKILL), (12345, signal.SIGKILL)]
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_signal_group_preserves_permission_denial_after_reap_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    process = _SignalProcess(
+        None,
+        wait_error=subprocess.TimeoutExpired('exiting-child', 0.0),
+    )
+    error = PermissionError('live group denied')
+    attempts = 0
+
+    def deny_signal(_pgid: int, _signum: int) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise error
+
+    monkeypatch.setattr(managed, '_process', process, raising=False)
+    monkeypatch.setattr(_posix.os, 'killpg', deny_signal)
+    monkeypatch.setattr(_posix.time, 'monotonic', lambda: 20.0)
+
+    with pytest.raises(PermissionError) as raised:
+        managed._signal_group(signal.SIGTERM, 20.0)
+
+    assert raised.value is error
+    assert process.poll_calls == 1
+    assert process.wait_timeouts == [0.0]
+    assert attempts == 1
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_signal_group_propagates_repeated_permission_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    process = _SignalProcess(0)
+    errors = iter(
+        (
+            PermissionError('zombie-only group'),
+            PermissionError('surviving group denied'),
+        )
+    )
+
+    def deny_signal(_pgid: int, _signum: int) -> None:
+        raise next(errors)
+
+    monkeypatch.setattr(managed, '_process', process, raising=False)
+    monkeypatch.setattr(_posix.os, 'killpg', deny_signal)
+
+    with pytest.raises(PermissionError, match='surviving group denied'):
+        managed._signal_group(signal.SIGTERM, 20.0)
+
+    assert process.poll_calls == 1
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_signal_group_suppresses_vanished_group_after_reaping_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    process = _SignalProcess(0)
+    errors = iter((PermissionError('zombie-only group'), ProcessLookupError('vanished')))
+    attempts = 0
+
+    def deny_then_vanish(_pgid: int, _signum: int) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise next(errors)
+
+    monkeypatch.setattr(managed, '_process', process, raising=False)
+    monkeypatch.setattr(_posix.os, 'killpg', deny_then_vanish)
+
+    managed._signal_group(signal.SIGTERM, 20.0)
+
+    assert process.poll_calls == 1
+    assert attempts == 2
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_signal_group_waits_for_exiting_leader_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    process = _SignalProcess(None)
+    attempts = 0
+
+    def exiting_then_signalable(_pgid: int, _signum: int) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError('zombie-only group')
+        assert process.poll_calls == 1
+        assert process.wait_timeouts == [8.0]
+
+    monkeypatch.setattr(managed, '_process', process, raising=False)
+    monkeypatch.setattr(_posix.os, 'killpg', exiting_then_signalable)
+    monkeypatch.setattr(_posix.time, 'monotonic', lambda: 12.0)
+
+    managed._signal_group(signal.SIGTERM, 20.0)
+
+    assert process.poll_calls == 1
+    assert process.wait_timeouts == [8.0]
+    assert attempts == 2
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
+def test_terminate_tree_shares_each_phase_deadline_with_signaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform == 'win32':
+        pytest.skip('POSIX containment requires POSIX')
+    managed = _PosixManagedStep.__new__(_PosixManagedStep)
+    events: list[tuple[str, float] | tuple[str, int, float]] = []
+    group_results = iter((False, True))
+    monotonic_values = iter((10.0, 20.0))
+
+    def monotonic() -> float:
+        value = next(monotonic_values)
+        events.append(('clock', value))
+        return value
+
+    def signal_group(signum: int, deadline: float) -> None:
+        events.append(('signal', signum, deadline))
+
+    def wait_for_group_exit(deadline: float) -> bool:
+        events.append(('group', deadline))
+        return next(group_results)
+
+    def wait_for_process_reap(deadline: float) -> bool:
+        events.append(('reap', deadline))
+        return True
+
+    monkeypatch.setattr(managed, '_graceful_signum', None, raising=False)
+    monkeypatch.setattr(managed, '_signal_group', signal_group, raising=False)
+    monkeypatch.setattr(managed, '_wait_for_group_exit', wait_for_group_exit, raising=False)
+    monkeypatch.setattr(managed, '_wait_for_process_reap', wait_for_process_reap, raising=False)
+    monkeypatch.setattr(_posix, '_FORCE_KILL_WAIT_SECONDS', 0.5)
+    monkeypatch.setattr(_posix.time, 'monotonic', monotonic)
+
+    managed.terminate_tree(2.0)
+
+    assert events == [
+        ('clock', 10.0),
+        ('signal', signal.SIGTERM, 12.0),
+        ('group', 12.0),
+        ('clock', 20.0),
+        ('signal', signal.SIGKILL, 20.5),
+        ('group', 20.5),
+        ('reap', 20.5),
+    ]
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX containment requires POSIX')
 def test_timeout_escalates_after_one_grace_period(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -771,11 +759,7 @@ def test_timeout_escalates_after_one_grace_period(
         result = _run_fixture(
             'sleep-ignore-term', '10', str(pid_file), timeout=0.05, diagnostics=Diagnostics(stream)
         )
-        result_transcript = step_transcript(
-            result,
-            stream.getvalue(),
-            command=(sys.executable, str(_FIXTURE), 'sleep-ignore-term', '10', str(pid_file)),
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
         elapsed = time.monotonic() - timeout_starts[0]
         pid = int(pid_file.read_text())
         assert result.failure is not None, result_transcript
@@ -820,9 +804,7 @@ def test_timeout_never_signals_unrelated_pid(tmp_path: Path) -> None:
     try:
         assert unrelated_ready_file.exists()
         result = _run_fixture('sleep', '10', timeout=0.05, diagnostics=Diagnostics(stream))
-        result_transcript = step_transcript(
-            result, stream.getvalue(), command=(sys.executable, str(_FIXTURE), 'sleep', '10')
-        )
+        result_transcript = step_transcript(result, stream.getvalue())
 
         assert result.failure is not None, result_transcript
         assert result.failure.kind is FailureKind.TIMEOUT, result_transcript
@@ -831,7 +813,3 @@ def test_timeout_never_signals_unrelated_pid(tmp_path: Path) -> None:
     finally:
         unrelated.kill()
         finish_process(unrelated, timeout=10)
-
-
-# POSIX cannot clean descendants after an uncatchable wrapper death. No passing
-# test simulates or claims that excluded cross-platform guarantee.

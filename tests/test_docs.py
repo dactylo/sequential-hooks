@@ -11,6 +11,13 @@ from urllib.parse import unquote
 import pytest
 
 from sequential_hooks._arguments import HookInvocation, parse_hook_argv
+from sequential_hooks._executor import (
+    _WINDOWS_CRASH_CODES,
+    _WINDOWS_CRASH_RANGE_END,
+    _WINDOWS_CRASH_RANGE_START,
+    _WINDOWS_RUNTIME_CRASH_RANGE_END,
+    _WINDOWS_RUNTIME_CRASH_RANGE_START,
+)
 
 _BARE_CLAUDE = re.compile(r'\bClaude\b(?!\s+Code\b)')
 _COMMAND_PREFIXES = ('git ', 'make ', 'pytest ', 'sequential-hooks ', 'uv tool ')
@@ -134,15 +141,10 @@ _EXPECTED_PROTOCOL_SCHEMA_HEADER = (
     'hookSpecificOutput members',
     'Coexistence and limits',
 )
-_EXPECTED_WINDOWS_CRASH_CODES = (
-    '0x80000001',
-    '0x80000002',
-    '0x80000003',
-    '0x80000004',
-)
+_EXPECTED_WINDOWS_CRASH_CODES = tuple(f'0x{code:08X}' for code in sorted(_WINDOWS_CRASH_CODES))
 _EXPECTED_WINDOWS_CRASH_RANGES = (
-    ('0xC0000000', '0xCFFFFFFF'),
-    ('0xE0000000', '0xEFFFFFFF'),
+    (f'0x{_WINDOWS_CRASH_RANGE_START:08X}', f'0x{_WINDOWS_CRASH_RANGE_END:08X}'),
+    (f'0x{_WINDOWS_RUNTIME_CRASH_RANGE_START:08X}', f'0x{_WINDOWS_RUNTIME_CRASH_RANGE_END:08X}'),
 )
 _FENCE = re.compile(r'^```([^\n]*)\n(.*?)^```$', re.MULTILINE | re.DOTALL)
 _HOST_VOCABULARY = {

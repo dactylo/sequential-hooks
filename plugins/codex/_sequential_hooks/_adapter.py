@@ -53,13 +53,8 @@ _PRE_HOOK_FIELDS = frozenset(
 )
 
 
-class CodexAdapter(Composer):
-    """Compose child results for one validated Codex event.
-
-    Child results are consumed in step order. Accepted mutations replace the
-    `tool_input` supplied to later children, and finalization emits the
-    composed native response.
-    """
+class _CodexAdapter(Composer):
+    """Compose child results for one validated Codex event."""
 
     def __init__(
         self,
@@ -69,18 +64,7 @@ class CodexAdapter(Composer):
         *,
         allow_on_failure: bool,
     ) -> None:
-        """Validate native input and initialize one Codex event adapter.
-
-        Args:
-            raw_input: Original strict JSON bytes received from Codex.
-            payload: Decoded strict JSON object matching `raw_input`.
-            diagnostics: Developer-tier diagnostic sink.
-            allow_on_failure: Whether approved pre-tool failures may continue.
-
-        Raises:
-            HostInputError: If required Codex input is missing or invalid, or
-                the payload nests too deeply to compose.
-        """
+        """Validate native input and initialize one Codex event adapter."""
         event = payload.get('hook_event_name')
         if event not in _EVENTS:
             raise HostInputError('Codex input has an unsupported hook event')
@@ -333,7 +317,7 @@ class CodexHost:
         diagnostics: Diagnostics,
         *,
         allow_on_failure: bool,
-    ) -> CodexAdapter:
+    ) -> _CodexAdapter:
         """Validate native input and construct the adapter for one invocation.
 
         Args:
@@ -349,7 +333,7 @@ class CodexHost:
         Raises:
             HostInputError: If the payload is not valid input for `event`.
         """
-        adapter = CodexAdapter(raw_input, payload, diagnostics, allow_on_failure=allow_on_failure)
+        adapter = _CodexAdapter(raw_input, payload, diagnostics, allow_on_failure=allow_on_failure)
         if adapter.event != event:
             raise HostInputError('Codex input event does not match the selected event')
         return adapter

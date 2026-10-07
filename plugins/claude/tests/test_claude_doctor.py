@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 
@@ -16,10 +15,17 @@ from plugins.claude._sequential_hooks._doctor import (
 from sequential_hooks._doctor._command import inspect_command
 from sequential_hooks._doctor._common import analyze_registration, analyze_registration_pairs
 from sequential_hooks._registry import load_host
-from sequential_hooks.hosts import Finding, FindingSeverity, LaunchSemantics, SourceKind
+from sequential_hooks.hosts import (
+    Finding,
+    FindingSeverity,
+    JsonObject,
+    JsonValue,
+    LaunchSemantics,
+    SourceKind,
+)
 
 
-def _write_settings(path: Path, hooks: object, **settings: object) -> None:
+def _write_settings(path: Path, hooks: JsonValue, **settings: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({'hooks': hooks, 'unrelated': 'private-sentinel', **settings}))
 
@@ -80,9 +86,12 @@ def test_bad_json_source_is_isolated_from_later_valid_source(
     assert 'private-command' not in rendered
 
 
+@pytest.mark.usefixtures('distribution_root')
+@pytest.mark.parametrize('direct', [False, True])
 def test_conflicting_project_values_make_only_non_managed_state_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    direct: bool,
 ) -> None:
     monkeypatch.setattr(_claude.sys, 'platform', 'linux')
     root = tmp_path / 'repo'
@@ -91,19 +100,16 @@ def test_conflicting_project_values_make_only_non_managed_state_unknown(
     (root / '.git').mkdir()
     _write_settings(root / '.claude/settings.json', {}, disableAllHooks=True)
     _write_settings(nested / '.claude/settings.json', {}, disableAllHooks=False)
+    local_hook: JsonObject = {'type': 'command', 'command': 'local'}
+    if direct:
+        local_hook['args'] = []
     _write_settings(
         root / '.claude/settings.local.json',
-        cast(
-            'object',
-            {'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'local', 'args': []}]}]},
-        ),
+        {'PreToolUse': [{'hooks': [local_hook]}]},
     )
     _write_settings(
         tmp_path / 'system/etc/claude-code/managed-settings.json',
-        cast(
-            'object',
-            {'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'managed', 'args': []}]}]},
-        ),
+        {'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'managed', 'args': []}]}]},
     )
 
     registrations, _findings = _load_registrations(
@@ -116,14 +122,26 @@ def test_conflicting_project_values_make_only_non_managed_state_unknown(
     ]
 
     registration = registrations[0]
-    findings = analyze_registration(
-        load_host('claude'),
-        (registration, inspect_command(registration, windows=False)),
-        path_value='',
-        path_ext=None,
-        windows=False,
+    findings = (
+        *registration.configuration_findings,
+        *analyze_registration(
+            load_host('claude'),
+            (registration, inspect_command(registration, windows=False)),
+            path_value='',
+            path_ext=None,
+            windows=False,
+        ),
     )
-    unknown = next(finding for finding in findings if finding.code == 'enabled_unknown')
+    unknowns = [finding for finding in findings if finding.code == 'enabled_unknown']
+    assert len(unknowns) == 1
+    unknown = unknowns[0]
+    assert unknown.severity is FindingSeverity.WARNING
+    assert [finding.code for finding in findings] == [
+        *(['claude_exec_form_recommended'] if not direct else []),
+        'enabled_unknown',
+        'outer_timeout_missing',
+        'child_executable_missing',
+    ]
     assert unknown.correction is not None
     assert 'disableAllHooks' in unknown.correction
     assert 'settings' in unknown.correction
@@ -164,10 +182,7 @@ def test_disable_all_hooks_uses_visible_scope_precedence(
         command = 'managed-child' if scope == 'managed' else f'{scope}-child'
         _write_settings(
             path,
-            cast(
-                'object',
-                {'PreToolUse': [{'hooks': [{'type': 'command', 'command': command, 'args': []}]}]},
-            ),
+            {'PreToolUse': [{'hooks': [{'type': 'command', 'command': command, 'args': []}]}]},
             **({'disableAllHooks': settings[scope]} if scope in settings else {}),
         )
 
@@ -352,23 +367,20 @@ def test_entry_enabled_field_has_no_activation_meaning(tmp_path: Path) -> None:
     source = tmp_path / '.claude/settings.json'
     _write_settings(
         source,
-        cast(
-            'object',
-            {
-                'PreToolUse': [
-                    {
-                        'hooks': [
-                            {
-                                'type': 'command',
-                                'command': 'child',
-                                'args': [],
-                                'enabled': None,
-                            }
-                        ]
-                    }
-                ]
-            },
-        ),
+        {
+            'PreToolUse': [
+                {
+                    'hooks': [
+                        {
+                            'type': 'command',
+                            'command': 'child',
+                            'args': [],
+                            'enabled': None,
+                        }
+                    ]
+                }
+            ]
+        },
     )
 
     registrations, findings = _load_registrations(
@@ -421,46 +433,43 @@ def test_load_registrations_preserves_native_shape_and_order(
 ) -> None:
     monkeypatch.setattr(_claude, 'sys', SimpleNamespace(platform='linux'))
     source = tmp_path / '.claude/settings.json'
-    hooks = cast(
-        'object',
-        {
-            'PreToolUse': [
-                {
-                    'matcher': 'Write|Edit',
-                    'hooks': [
-                        {
-                            'type': 'command',
-                            'command': 'sequential-hooks',
-                            'args': ['--agent', 'claude', 'first'],
-                            'timeout': 30,
-                            'enabled': False,
-                        },
-                        {
-                            'type': 'command',
-                            'command': 'sequential-hooks --agent claude second',
-                            'timeout': 45.5,
-                        },
-                    ],
-                },
-                {
-                    'hooks': [
-                        {
-                            'type': 'command',
-                            'command': 'third',
-                            'args': [],
-                            'enabled': True,
-                        }
-                    ]
-                },
-            ],
-            'PostToolUse': [
-                {
-                    'matcher': '*',
-                    'hooks': [{'type': 'command', 'command': 'fourth'}],
-                }
-            ],
-        },
-    )
+    hooks: JsonValue = {
+        'PreToolUse': [
+            {
+                'matcher': 'Write|Edit',
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': 'sequential-hooks',
+                        'args': ['--agent', 'claude', 'first'],
+                        'timeout': 30,
+                        'enabled': False,
+                    },
+                    {
+                        'type': 'command',
+                        'command': 'sequential-hooks --agent claude second',
+                        'timeout': 45.5,
+                    },
+                ],
+            },
+            {
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': 'third',
+                        'args': [],
+                        'enabled': True,
+                    }
+                ]
+            },
+        ],
+        'PostToolUse': [
+            {
+                'matcher': '*',
+                'hooks': [{'type': 'command', 'command': 'fourth'}],
+            }
+        ],
+    }
     _write_settings(
         source,
         hooks,
@@ -549,10 +558,7 @@ def test_malformed_disable_all_hooks_matches_source_rejection(
     )
     _write_settings(
         source,
-        cast(
-            'object',
-            {'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'child', 'args': []}]}]},
-        ),
+        {'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'child', 'args': []}]}]},
         disableAllHooks='private-invalid-value',
     )
 
@@ -597,10 +603,9 @@ def test_managed_drop_ins_override_the_base_in_filename_order(
 ) -> None:
     monkeypatch.setattr(_claude.sys, 'platform', 'linux')
     managed = tmp_path / 'system/etc/claude-code'
-    hooks = cast(
-        'object',
-        {'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'managed', 'args': []}]}]},
-    )
+    hooks: JsonValue = {
+        'PreToolUse': [{'hooks': [{'type': 'command', 'command': 'managed', 'args': []}]}]
+    }
     _write_settings(managed / 'managed-settings.json', hooks, disableAllHooks=True)
     _write_settings(managed / 'managed-settings.d/20-enable.json', {}, disableAllHooks=False)
     _write_settings(managed / 'managed-settings.d/10-disable.json', {}, disableAllHooks=True)
@@ -727,6 +732,7 @@ def test_present_null_matcher_is_malformed(tmp_path: Path) -> None:
     assert 'private-command' not in findings[0].message
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_stop_wrapper_reports_only_unservable_native_event(tmp_path: Path) -> None:
     source = tmp_path / '.claude/settings.json'
     _write_settings(

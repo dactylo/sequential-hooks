@@ -1,7 +1,7 @@
 # Claude Code
 
-Use `sequential-hooks` for Claude Code `PreToolUse` and `PostToolUse` command hooks. Claude Code
-owns these local files:
+Use sequential-hooks for Claude Code `PreToolUse` and `PostToolUse` command hooks. Claude Code owns
+these local files:
 
 - User: `~/.claude/settings.json`.
 - Project: `.claude/settings.json`.
@@ -13,7 +13,7 @@ owns these local files:
 - Windows managed: `C:\Program Files\ClaudeCode\managed-settings.json` and JSON files in
   `C:\Program Files\ClaudeCode\managed-settings.d\`.
 
-`sequential-hooks` has no configuration file.
+sequential-hooks has no configuration file.
 
 Official references: [hooks](https://code.claude.com/docs/en/hooks) and
 [hooks guide](https://code.claude.com/docs/en/hooks-guide).

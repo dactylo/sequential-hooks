@@ -2,7 +2,7 @@
 
 ## Local environment
 
-Run `make setup` from the checkout with uv 0.12.13 and a supported `python` on `PATH`. It
+Run `make setup` from the checkout with uv 0.12.23 and a supported `python` on `PATH`. It
 synchronizes the hashed development lock into `.venv`. `make quality` runs the read-only
 formatting, lock, type, dead-code, and whitespace checks; `make check` adds the full test suite.
 `make test` runs that suite alone, and `make format` applies the repository formatters. Project
@@ -31,17 +31,19 @@ as `CI / push skipped` and run no jobs; CI runs only on request. A newer request
 cancels an older one. Push runs are never cancelled, because the Release workflow needs the tagged
 commit's push run.
 
-| Requested run                                                 | Actions > CI > Run workflow | Title               |
-| ------------------------------------------------------------- | --------------------------- | ------------------- |
-| Quick: local runners, slow tests omitted on macOS and Windows | hosted off, slow tests off  | `CI / local`        |
-| Full: local runners, every test                               | hosted off, slow tests on   | `CI / local (full)` |
-| Hosted: GitHub-hosted runners, every test                     | hosted on                   | `CI / hosted`       |
+| Requested run                              | Actions > CI > Run workflow | Title               |
+| ------------------------------------------ | --------------------------- | ------------------- |
+| Local runners, every test                  | hosted off, full tests off  | `CI / local`        |
+| Local runners, explicit full-suite request | hosted off, full tests on   | `CI / local (full)` |
+| Hosted: GitHub-hosted runners, every test  | hosted on                   | `CI / hosted`       |
 
 The `test` matrix covers Python 3.13 to 3.15 on Linux and Python 3.13 on macOS and Windows. All
-test jobs have a one-hour hang guard, on local and hosted runners, in quick and full runs.
-`package` also loads the bundled plugin entry points from the installed wheel. The required native
-POSIX and Windows containment tiers run separately in both modes, and CI rejects a tier with
-skipped tests. The ordinary suite excludes those native tiers.
+test jobs have a one-hour hang guard, on local and hosted runners. `package` also loads the bundled
+plugin entry points from the installed wheel. The required native POSIX and Windows containment
+tiers run separately in both modes, and CI rejects a tier with skipped tests. The ordinary suite
+excludes those native tiers.
+
+Both values of `full_tests` run every current test; there is no separate slow-test selection.
 
 CI runs tests in parallel with pytest-xdist. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` when a runner's
 visible CPU count exceeds its CPU quota. For the same scheduling locally, run:
@@ -70,10 +72,9 @@ CI.
 
 ## Native test tiers
 
-Currently no tests carry the `slow` marker, so both modes select the same ordinary suite. The
-required native POSIX and Windows containment tiers run separately in both modes, and CI rejects a
-tier with skipped tests. The ordinary suite excludes those native tiers. Test jobs use the same
-one-hour hang guard in every mode. Run the full local suite with `make test`.
+The required native POSIX and Windows containment tiers run separately, and CI rejects a tier with
+skipped tests. The ordinary suite excludes those native tiers. Test jobs use the same one-hour hang
+guard in every mode. Run the full local suite with `make test`.
 
 The Markdown formatter uses Taplo for TOML code blocks and shfmt for shell code blocks. CI
 downloads their official Linux binaries for the quality runner's architecture and verifies pinned

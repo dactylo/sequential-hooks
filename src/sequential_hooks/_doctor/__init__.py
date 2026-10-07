@@ -4,7 +4,7 @@ import importlib.metadata
 import sys
 from collections.abc import Iterable
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Protocol
 
 from sequential_hooks._doctor._command import inspect_command, redact_command
@@ -13,16 +13,10 @@ from sequential_hooks._doctor._common import (
     analyze_registration_pairs,
     inspect_platform,
 )
-from sequential_hooks._doctor._types import (
-    ConfigSource,
-    DoctorReport,
-    Finding,
-    FindingSeverity,
-    PlatformReport,
-    Registration,
-)
+from sequential_hooks._doctor._types import DoctorReport, PlatformReport
 from sequential_hooks._executable import ExecutableStatus, resolve_executable
 from sequential_hooks._registry import HostLoadError, load_host
+from sequential_hooks.hosts import ConfigSource, Finding, FindingSeverity, Registration
 
 
 class DoctorOutput(Protocol):
@@ -112,6 +106,17 @@ def _render_limitations(
     stream.writelines(f'- {_render_scalar(limitation)}\n' for limitation in combined)
 
 
+def _render_path(path: PurePath) -> str:
+    """Render path separators portably while preserving namespace spelling."""
+    text = str(path)
+    if not (
+        isinstance(path, PureWindowsPath)
+        and text.replace('/', '\\').startswith(('\\\\?\\', '\\\\.\\', '\\??\\'))
+    ):
+        text = path.as_posix()
+    return _render_scalar(text)
+
+
 def _render_registrations(
     registrations: tuple[Registration, ...],
     stream: DoctorOutput,
@@ -133,7 +138,7 @@ def _render_registrations(
             else 'unavailable'
         )
         stream.write(
-            f'- source: {_render_scalar(registration.source.path)}\n'
+            f'- source: {_render_path(registration.source.path)}\n'
             f'  event: {_render_scalar(registration.event)}\n'
             f'  matcher: {_render_scalar(matcher)}\n'
             f'  command: {_render_scalar(redact_command(registration, windows=windows))}\n'
@@ -154,13 +159,13 @@ def _render_sources(sources: tuple[ConfigSource, ...], stream: DoctorOutput) -> 
     for source in sources:
         state = 'exists' if source.exists else 'missing'
         stream.write(
-            f'- [{_render_scalar(source.kind.value)}] {_render_scalar(source.path)}: {state}\n'
+            f'- [{_render_scalar(source.kind.value)}] {_render_path(source.path)}: {state}\n'
         )
 
 
 def _render_report(report: DoctorReport, stream: DoctorOutput) -> None:
     """Render one deterministic, redaction-safe human report."""
-    wrapper = str(report.executable) if report.executable is not None else 'not found'
+    wrapper = _render_path(report.executable) if report.executable is not None else 'not found'
     version = report.version if report.version is not None else 'unknown'
     job_object = (
         'not applicable'
@@ -171,7 +176,7 @@ def _render_report(report: DoctorReport, stream: DoctorOutput) -> None:
         'sequential-hooks doctor\n'
         'display: ASCII backslash escapes; \\\\ represents one literal backslash\n'
         f'agent: {_render_scalar(report.host)}\n'
-        f'wrapper: {_render_scalar(wrapper)}\n'
+        f'wrapper: {wrapper}\n'
         f'version: {_render_scalar(version)}\n'
         f'interpreter: {_render_scalar(report.platform.interpreter)}\n'
         f'containment: {_render_scalar(report.platform.containment)}\n'

@@ -2,14 +2,13 @@
 
 import io
 import json
-import sys
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 import sequential_hooks.hosts._skeleton as skeleton_module
-from plugins.codex._sequential_hooks._adapter import CodexAdapter, CodexHost
+from plugins.codex._sequential_hooks._adapter import CodexHost, _CodexAdapter
 from sequential_hooks._diagnostics import Diagnostics
 from sequential_hooks._executor import _STDOUT_LIMIT_BYTES, ProcessExecutor
 from sequential_hooks._runner import run_pipeline
@@ -35,7 +34,7 @@ _FIXTURE_ROOT = Path(__file__).parent / 'fixtures'
 _IMPOSSIBLE_STEP_NAME = 'x' * FINAL_RESPONSE_LIMIT_BYTES
 
 
-class _OutputFailureAdapter(CodexAdapter):
+class _OutputFailureAdapter(_CodexAdapter):
     def consume_output_failure(
         self,
         step: Step,
@@ -72,16 +71,6 @@ def _chunked_mutation(character_count: int) -> JsonObject:
     return {'chunks': chunks}
 
 
-def _deep_mutation() -> JsonObject:
-    root: JsonObject = {'command': 'replacement'}
-    cursor = root
-    for _index in range(sys.getrecursionlimit() + 100):
-        child: JsonObject = {}
-        cursor['next'] = child
-        cursor = child
-    return root
-
-
 def _fixture_bytes(name: str) -> bytes:
     return (_FIXTURE_ROOT / name).read_bytes()
 
@@ -96,10 +85,10 @@ def _make_adapter_with_stream(
     raw_input: bytes,
     *,
     allow_on_failure: bool = False,
-) -> tuple[CodexAdapter, io.StringIO]:
+) -> tuple[_CodexAdapter, io.StringIO]:
     payload = load_object(raw_input)
     stream = io.StringIO()
-    adapter = CodexAdapter(
+    adapter = _CodexAdapter(
         raw_input,
         payload,
         Diagnostics(stream),
@@ -112,7 +101,7 @@ def _make_adapter(
     raw_input: bytes,
     *,
     allow_on_failure: bool = False,
-) -> CodexAdapter:
+) -> _CodexAdapter:
     adapter, _stream = _make_adapter_with_stream(
         raw_input,
         allow_on_failure=allow_on_failure,
@@ -152,11 +141,11 @@ def _pre_protocol(
     return _protocol_output({'hookSpecificOutput': hook})
 
 
-def _response_bytes(adapter: CodexAdapter) -> bytes:
+def _response_bytes(adapter: _CodexAdapter) -> bytes:
     return adapter.finalize().stdout
 
 
-def _response_message(adapter: CodexAdapter) -> str:
+def _response_message(adapter: _CodexAdapter) -> str:
     response = load_object(_response_bytes(adapter))
     if 'systemMessage' in response:
         return cast('str', response['systemMessage'])
@@ -202,7 +191,7 @@ def _boundary_mutation(extra_bytes: int = 0) -> tuple[JsonObject, bytes]:
     return mutation, expected
 
 
-def _accept_exact_boundary_mutation(adapter: CodexAdapter) -> JsonObject:
+def _accept_exact_boundary_mutation(adapter: _CodexAdapter) -> JsonObject:
     for index in range(1, _BOUNDARY_PRIOR_COUNT + 1):
         adapter.consume(
             _step(index, f'prior-{index}'),
@@ -328,32 +317,52 @@ def test_codex_current_and_legacy_pre_decisions_are_ambiguous() -> None:
     assert 'unsupported' in _response_message(adapter)
 
 
-def test_codex_deep_mutation_copy_propagates_atomically(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize('allow_on_failure', [False, True])
+@pytest.mark.parametrize('depth', [300, 600])
+def test_codex_deep_mutation_uses_normal_failure_policy(
+    allow_on_failure: bool,
+    depth: int,
 ) -> None:
-    adapter = _make_adapter(_fixture_bytes('codex_pre.json'))
+    adapter, stream = _make_adapter_with_stream(
+        _fixture_bytes('codex_pre.json'),
+        allow_on_failure=allow_on_failure,
+    )
     prior_input = adapter.step_input()
-    prior_response = adapter.finalize()
-    assert adapter.step_input() == prior_input
-    assert adapter.finalize() == prior_response
-    mutation = _deep_mutation()
+    hook = (
+        b'{"hookSpecificOutput":{"hookEventName":"PreToolUse",'
+        b'"permissionDecision":"allow","updatedInput":'
+    )
+    mutation = (
+        b'{"command":"replacement","nested":' + b'{"next":' * depth + b'null' + b'}' * depth + b'}'
+    )
+    stdout = hook + mutation + b'}}'
+    # The actual strict loader accepts both depths; rejection belongs to composition.
+    load_object(stdout)
+    steps = (_step(1, 'mutator'), _step(2, 'later'))
+    executor = _QueueExecutor([_output(stdout), _protocol_output({'systemMessage': 'later ran'})])
 
-    def load_deep_mutation(_stdout: bytes) -> JsonObject:
-        return {
-            'hookSpecificOutput': {
-                'hookEventName': 'PreToolUse',
-                'permissionDecision': 'allow',
-                'updatedInput': mutation,
-            }
-        }
+    response = run_pipeline(
+        adapter,
+        steps,
+        executor,
+        None,
+        allow_on_failure=allow_on_failure,
+    )
 
-    monkeypatch.setattr(skeleton_module, 'load_object', load_deep_mutation)
-
-    with pytest.raises(RecursionError):
-        adapter.consume(_step(1), _output(b'ignored'))
-
-    assert adapter.step_input() == prior_input
-    assert adapter.finalize() == prior_response
+    rejected = depth == 600
+    stopped = rejected and not allow_on_failure
+    assert executor.calls == list(steps[:1] if stopped else steps)
+    assert response.exit_code == 0
+    assert (b'later ran' in response.stdout) is not stopped
+    if rejected:
+        assert adapter.step_input() == prior_input
+        assert 'malformed' in stream.getvalue()
+        assert b'malformed' in response.stdout
+        if stopped:
+            assert b'"permissionDecision":"deny"' in response.stdout
+    else:
+        assert adapter.step_input() != prior_input
+        assert not stream.getvalue()
 
 
 def test_codex_developer_text_diagnostic_is_bounded() -> None:
@@ -625,10 +634,10 @@ def test_codex_fitting_builds_and_encodes_each_candidate_once(
         ),
     )
     counts = {'build': 0, 'encode': 0}
-    final_object = CodexAdapter.build_response
+    final_object = _CodexAdapter.build_response
     encode_response = skeleton_module.encode_response
 
-    def counted_final_object(self: CodexAdapter) -> JsonObject:
+    def counted_final_object(self: _CodexAdapter) -> JsonObject:
         counts['build'] += 1
         return final_object(self)
 
@@ -636,7 +645,7 @@ def test_codex_fitting_builds_and_encodes_each_candidate_once(
         counts['encode'] += 1
         return encode_response(response)
 
-    monkeypatch.setattr(CodexAdapter, 'build_response', counted_final_object)
+    monkeypatch.setattr(_CodexAdapter, 'build_response', counted_final_object)
     monkeypatch.setattr(skeleton_module, 'encode_response', counted_encode_response)
 
     control = adapter.consume(
@@ -1409,30 +1418,8 @@ def test_codex_pre_replacement_validates_tool_kind(
 
 def test_codex_reachable_mutation_exact_final_boundary_is_accepted() -> None:
     adapter = _make_adapter(_fixture_bytes('codex_pre.json'))
-    for index in range(1, _BOUNDARY_PRIOR_COUNT + 1):
-        adapter.consume(
-            _step(index, f'prior-{index}'),
-            _pre_protocol(
-                'allow',
-                reason=_BOUNDARY_PRIOR_REASON,
-                updated_input={'command': f'prior-{index}'},
-            ),
-        )
-    mutation, expected = _boundary_mutation()
-    candidate = _pre_protocol(
-        'allow',
-        reason=_BOUNDARY_CANDIDATE_REASON,
-        updated_input=mutation,
-    )
-    assert len(candidate.stdout) < _STDOUT_LIMIT_BYTES
+    mutation = _accept_exact_boundary_mutation(adapter)
 
-    control = adapter.consume(
-        _step(_BOUNDARY_PRIOR_COUNT + 1, 'candidate'),
-        candidate,
-    )
-
-    assert control == 'continue'
-    assert adapter.finalize().stdout == expected
     assert load_object(adapter.step_input())['tool_input'] == mutation
 
 
@@ -1911,7 +1898,7 @@ def test_configuration_response_is_independent_of_adapter_construction(
     def unavailable(*_args: object, **_kwargs: object) -> None:
         raise AssertionError('configuration response must not construct an adapter')
 
-    monkeypatch.setattr('plugins.codex._sequential_hooks._adapter.CodexAdapter', unavailable)
+    monkeypatch.setattr('plugins.codex._sequential_hooks._adapter._CodexAdapter', unavailable)
     monkeypatch.setattr(CodexHost, 'adapter', unavailable)
     stream = io.StringIO()
     response = CodexHost().configuration_response(

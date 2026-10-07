@@ -990,10 +990,7 @@ def test_executor_thread_start_failure_retains_gate_for_non_overrideable_cleanup
 ) -> None:
     events: list[str] = []
     gate_pipes: list[tuple[int, int, int, int]] = []
-    real_create_gate_pipes = cast(
-        'Callable[[], tuple[int, int, int, int]]',
-        vars(windows_module)['_create_gate_pipes'],
-    )
+    real_create_gate_pipes = windows_module._create_gate_pipes
 
     def capture_gate_pipes() -> tuple[int, int, int, int]:
         pipes = real_create_gate_pipes()

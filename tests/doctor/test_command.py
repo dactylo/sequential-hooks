@@ -1,47 +1,16 @@
 import os
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from sequential_hooks._doctor._command import inspect_command, redact_command
-from sequential_hooks._doctor._types import (
-    ConfigSource,
+from sequential_hooks.hosts import (
     ContractError,
     LaunchSemantics,
-    Registration,
-    SourceKind,
 )
 from tests._distributions import register_distribution
-
-
-def _registration(
-    command: str = 'sequential-hooks --agent codex child',
-    **changes: object,
-) -> Registration:
-    if 'semantics' in changes:
-        changes['launch_semantics'] = changes.pop('semantics')
-    if 'windows_semantics' in changes:
-        changes['windows_launch_semantics'] = changes.pop('windows_semantics')
-    registration = Registration(
-        source=ConfigSource(
-            path=Path('/safe/config.json'),
-            kind=SourceKind.USER,
-            exists=True,
-        ),
-        event='PostToolUse',
-        matcher=None,
-        command=command,
-        args=None,
-        launch_semantics=LaunchSemantics.POSIX_SHELL,
-        command_windows=None,
-        windows_launch_semantics=None,
-        timeout=30.0,
-        enabled=True,
-        type=None,
-    )
-    return replace(registration, **changes)
+from tests.doctor._helpers import registration as _registration
 
 
 def test_absolute_wrapper_and_non_wrapper_are_distinguished(tmp_path: Path) -> None:
@@ -131,6 +100,27 @@ def test_malformed_wrapper_returns_safe_error() -> None:
     assert 'super-secret' not in result.error
 
 
+@pytest.mark.parametrize(
+    ('event', 'expected'), [('BeforeTool', None), ('Other', ContractError.WRONG_EVENT)]
+)
+def test_malformed_wrapper_uses_the_selected_host_event_domain(
+    distribution_root: Path,
+    event: str,
+    expected: ContractError | None,
+) -> None:
+    register_distribution(
+        distribution_root,
+        'sequential-hooks-host-example',
+        {'example': 'tests.hosts_example.host:ExampleHost'},
+    )
+    inspected = inspect_command(
+        _registration(f'sequential-hooks --agent example --event {event} child --'), windows=False
+    )
+
+    assert inspected.error is not None
+    assert inspected.contract_error == expected
+
+
 def test_posix_shell_comment_before_newline_remains_dynamic() -> None:
     result = inspect_command(
         _registration('sequential-hooks --agent codex child # ignored\nsecond-command'),
@@ -140,6 +130,29 @@ def test_posix_shell_comment_before_newline_remains_dynamic() -> None:
     assert result.dynamic is True
     assert result.argv is None
     assert result.invocation is None
+
+
+@pytest.mark.parametrize(
+    ('suffix', 'expected'),
+    [
+        ('arg # ignored --agent agy', 'arg'),
+        ('word#literal', 'word#literal'),
+        (r'\#literal', '#literal'),
+        ("'#literal'", '#literal'),
+        ('"#literal"', '#literal'),
+    ],
+)
+def test_posix_shell_comment_boundary_preserves_literal_hashes(
+    suffix: str,
+    expected: str,
+) -> None:
+    result = inspect_command(
+        _registration(f'sequential-hooks --agent codex child {suffix}'), windows=False
+    )
+
+    assert result.argv == ('sequential-hooks', '--agent', 'codex', 'child', expected)
+    assert result.invocation is not None
+    assert result.invocation.steps[0].argv == ('child', expected)
 
 
 @pytest.mark.parametrize(
@@ -172,55 +185,11 @@ def test_posix_shell_dynamic_syntax_is_not_parsed(syntax: str) -> None:
     assert result.invocation is None
 
 
-@pytest.mark.parametrize(
-    ('suffix', 'expected'),
-    [
-        ('arg # ignored --agent agy', 'arg'),
-        ('word#literal', 'word#literal'),
-        (r'\#literal', '#literal'),
-        ("'#literal'", '#literal'),
-        ('"#literal"', '#literal'),
-    ],
-)
-def test_posix_shell_comment_boundary_preserves_literal_hashes(
-    suffix: str,
-    expected: str,
-) -> None:
-    result = inspect_command(
-        _registration(f'sequential-hooks --agent codex child {suffix}'), windows=False
-    )
-
-    assert result.argv == ('sequential-hooks', '--agent', 'codex', 'child', expected)
-    assert result.invocation is not None
-    assert result.invocation.steps[0].argv == ('child', expected)
-
-
 def test_posix_shell_leading_nonstandalone_bang_remains_literal() -> None:
     result = inspect_command(_registration('!literal'), windows=False)
 
     assert result.dynamic is False
     assert result.argv == ('!literal',)
-
-
-@pytest.mark.parametrize(
-    ('literal', 'expected'),
-    [
-        ("'$HOME'", '$HOME'),
-        ("'`pwd`'", '`pwd`'),
-    ],
-)
-def test_posix_shell_single_quoted_expansion_markers_remain_literal(
-    literal: str,
-    expected: str,
-) -> None:
-    result = inspect_command(
-        _registration(f'sequential-hooks --agent codex child {literal}'),
-        windows=False,
-    )
-
-    assert result.dynamic is False
-    assert result.invocation is not None
-    assert result.invocation.steps[0].argv == ('child', expected)
 
 
 @pytest.mark.parametrize(
@@ -276,6 +245,27 @@ def test_posix_shell_quoted_or_escaped_globs_remain_literal(literal: str) -> Non
     assert result.invocation is not None
 
 
+@pytest.mark.parametrize(
+    ('literal', 'expected'),
+    [
+        ("'$HOME'", '$HOME'),
+        ("'`pwd`'", '`pwd`'),
+    ],
+)
+def test_posix_shell_single_quoted_expansion_markers_remain_literal(
+    literal: str,
+    expected: str,
+) -> None:
+    result = inspect_command(
+        _registration(f'sequential-hooks --agent codex child {literal}'),
+        windows=False,
+    )
+
+    assert result.dynamic is False
+    assert result.invocation is not None
+    assert result.invocation.steps[0].argv == ('child', expected)
+
+
 @pytest.mark.parametrize('literal', ['!', '!literal'])
 def test_posix_shell_unquoted_bang_arguments_remain_literal(literal: str) -> None:
     result = inspect_command(
@@ -301,6 +291,7 @@ def test_posix_wrapper_recognition_remains_case_sensitive() -> None:
     assert result.invocation is None
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('command', 'expected'),
     [
@@ -338,52 +329,6 @@ def test_redaction_replaces_arbitrary_leading_environment_block() -> None:
     assert 'private-sentinel' not in rendered
     assert 'OTHER_KEY' not in rendered
     assert 'other-sentinel' not in rendered
-
-
-def test_short_agent_option_is_inspected() -> None:
-    result = inspect_command(_registration('sequential-hooks -a codex child'), windows=False)
-
-    assert result.error is None
-    assert result.invocation is not None
-    assert result.invocation.host == 'codex'
-
-
-def test_short_event_option_is_inspected() -> None:
-    result = inspect_command(
-        _registration('sequential-hooks -a agy -e PreToolUse child'), windows=False
-    )
-
-    assert result.error is None
-    assert result.invocation is not None
-    assert result.invocation.event == 'PreToolUse'
-
-
-def test_unrecognized_wrapper_parse_error_remains_text() -> None:
-    result = inspect_command(
-        _registration('sequential-hooks --bogus --agent codex child'),
-        windows=False,
-    )
-
-    assert result.contract_error is None
-    assert result.error is not None
-    assert not result.error.startswith('wrapper_contract:')
-
-
-@pytest.mark.parametrize(
-    'command',
-    [
-        'sequential-hooks --agent codex --event PostToolUse child',
-        'sequential-hooks --agent agy child',
-        'sequential-hooks --agent agy --event Other child',
-        'sequential-hooks --agent unknown child',
-    ],
-)
-def test_well_formed_contract_violations_parse_for_invocation_analysis(command: str) -> None:
-    result = inspect_command(_registration(command), windows=False)
-
-    assert result.invocation is not None
-    assert result.contract_error is None
-    assert result.error is None
 
 
 @pytest.mark.parametrize(
@@ -531,6 +476,35 @@ def test_redaction_uses_exact_secret_option_grammar(command: str, expected: str)
     assert redact_command(_registration(command)) == expected
 
 
+def test_short_agent_option_is_inspected() -> None:
+    result = inspect_command(_registration('sequential-hooks -a codex child'), windows=False)
+
+    assert result.error is None
+    assert result.invocation is not None
+    assert result.invocation.host == 'codex'
+
+
+def test_short_event_option_is_inspected() -> None:
+    result = inspect_command(
+        _registration('sequential-hooks -a agy -e PreToolUse child'), windows=False
+    )
+
+    assert result.error is None
+    assert result.invocation is not None
+    assert result.invocation.event == 'PreToolUse'
+
+
+def test_unrecognized_wrapper_parse_error_remains_text() -> None:
+    result = inspect_command(
+        _registration('sequential-hooks --bogus --agent codex child'),
+        windows=False,
+    )
+
+    assert result.contract_error is None
+    assert result.error is not None
+    assert not result.error.startswith('wrapper_contract:')
+
+
 @pytest.mark.parametrize(
     'semantics',
     [
@@ -545,6 +519,23 @@ def test_unverified_grammars_are_uninspectable(semantics: LaunchSemantics) -> No
     assert result.argv is None
     assert result.dynamic is False
     assert result.error is not None
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        'sequential-hooks --agent codex --event PostToolUse child',
+        'sequential-hooks --agent agy child',
+        'sequential-hooks --agent agy --event Other child',
+        'sequential-hooks --agent unknown child',
+    ],
+)
+def test_well_formed_contract_violations_parse_for_invocation_analysis(command: str) -> None:
+    result = inspect_command(_registration(command), windows=False)
+
+    assert result.invocation is not None
+    assert result.contract_error is None
+    assert result.error is None
 
 
 def test_windows_uses_only_documented_windows_form() -> None:
@@ -585,24 +576,3 @@ def test_windows_wrapper_recognition_is_path_and_case_insensitive(
     )
 
     assert result.invocation is not None
-
-
-@pytest.mark.parametrize(
-    ('event', 'expected'), [('BeforeTool', None), ('Other', ContractError.WRONG_EVENT)]
-)
-def test_malformed_wrapper_uses_the_selected_host_event_domain(
-    distribution_root: Path,
-    event: str,
-    expected: ContractError | None,
-) -> None:
-    register_distribution(
-        distribution_root,
-        'sequential-hooks-host-example',
-        {'example': 'tests.hosts_example.host:ExampleHost'},
-    )
-    inspected = inspect_command(
-        _registration(f'sequential-hooks --agent example --event {event} child --'), windows=False
-    )
-
-    assert inspected.error is not None
-    assert inspected.contract_error == expected

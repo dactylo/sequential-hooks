@@ -2,17 +2,17 @@
 
 """Implement command-line entry points for hooks and doctor checks."""
 
+import io
 import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import BinaryIO
+from typing import IO, BinaryIO, cast
 
 from sequential_hooks._arguments import HookInvocation, InvocationError, parse_hook_argv
-from sequential_hooks._cleanup import CleanupState
 from sequential_hooks._diagnostics import Diagnostics
-from sequential_hooks._downstream import closable_stdout, is_downstream_closure, silence_descriptor
+from sequential_hooks._downstream import is_downstream_closure, silence_descriptor
 from sequential_hooks._executor import ForwardedSignal, ProcessExecutor
 from sequential_hooks._registry import HostLoadError, load_host
 from sequential_hooks._runner import run_pipeline
@@ -26,28 +26,35 @@ from sequential_hooks.hosts import (
 from sequential_hooks.hosts._json import JsonProtocolError, load_object
 
 _DOCTOR_HELP = """usage: sequential-hooks doctor --agent NAME
-       sequential-hooks doctor --help
 
-Check coding-agent configuration and platform containment support.
+Check an agent's hook configuration and platform containment support without
+changing anything.
 
 options:
-  -a, --agent NAME          registered coding agent
-  -h, --help
+  -h, --help              show this help message and exit
+  -a, --agent NAME        coding agent, such as agy, claude, or codex
 """
-_HELP = """usage: sequential-hooks --agent NAME [OPTIONS] CHILD [ARGS] [-- CHILD [ARGS]]...
-       sequential-hooks doctor --help
+_HELP = """usage: sequential-hooks --agent NAME [options] STEP [ARG ...] [-- STEP [ARG ...]] ...
+       sequential-hooks doctor --agent NAME
 
-Compose one through three hook commands in order.
+Run up to three hook commands in order as one coding-agent hook.
 
 options:
-  -a, --agent NAME          registered coding agent
-  -e, --event EVENT         required when the agent payload carries no event
-  --step-timeout SECONDS
-  --allow-on-failure
-  -h, --help
-  --version
+  -h, --help              show this help message and exit
+  --version               show the version and exit
+  -a, --agent NAME        coding agent, such as agy, claude, or codex
+  -e, --event EVENT       hook event, for agents whose payload omits it (agy)
+  --step-timeout SECONDS  time limit for each step (default: none)
+  --allow-on-failure      on pre-tool events, report a failed step and continue
+                          instead of blocking; on any event, run a step without
+                          containment when containment cannot be set up
 
-The exact -- token separates child commands and is unavailable to a child.
+Separate steps with --; no step receives -- as an argument. Each step receives
+the agent's payload, as updated by earlier steps, and only its own arguments.
+Put wrapper options before the first step.
+
+example:
+  sequential-hooks --agent claude first-hook --check -- second-hook
 """
 _INTERNAL_FAILURE_DIAGNOSTIC = 'unexpected internal failure'
 _INVALID_INPUT_DIAGNOSTIC = 'native hook input is invalid'
@@ -126,14 +133,12 @@ def _native_context(
         trusted = _explicit_event(spec, event)
         return _NativeContext(trusted, raw_input, load_object(raw_input))
     payload = load_object(raw_input)
-    failure = CleanupState()
-    payload_event: str | None = None
-    with failure:
+    try:
         payload_event = spec.payload_event(payload)
-    if failure.first_error is not None:
+    except Exception as error:
         raise _NoTrustedEventError(
-            f'host {spec.name} event resolution failed: {type(failure.first_error).__name__}'
-        ) from failure.first_error
+            f'host {spec.name} event resolution failed: {type(error).__name__}'
+        ) from error
     if payload_event is None or payload_event not in spec.events:
         raise _NoTrustedEventError('native event could not be established')
     return _NativeContext(payload_event, raw_input, payload)
@@ -142,11 +147,10 @@ def _native_context(
 def _run_doctor_cli(
     arguments: tuple[str, ...],
     diagnostics: Diagnostics,
-) -> int:
+) -> tuple[int, str]:
     """Parse and run the isolated doctor command grammar."""
     if arguments in {('doctor', '-h'), ('doctor', '--help')}:
-        sys.stdout.write(_DOCTOR_HELP)
-        return 0
+        return 0, _DOCTOR_HELP
     if (
         len(arguments) != _VALID_DOCTOR_ARGUMENT_COUNT
         or arguments[1] not in {'-a', '--agent'}
@@ -154,13 +158,14 @@ def _run_doctor_cli(
         or arguments[2].startswith('-')
     ):
         diagnostics.write_global('invalid doctor invocation; use doctor --help')
-        return 2
+        return 2, ''
     host = arguments[2]
     home = Path.home()
     cwd = Path.cwd()
     from sequential_hooks._doctor import run_doctor  # noqa: PLC0415
 
-    return run_doctor(
+    report = io.StringIO()
+    status = run_doctor(
         host,
         home=home,
         cwd=cwd,
@@ -171,8 +176,9 @@ def _run_doctor_cli(
         ),
         path_value=os.environ.get('PATH'),
         path_ext=os.environ.get('PATHEXT'),
-        stream=sys.stdout,
+        stream=report,
     )
+    return status, report.getvalue()
 
 
 def _trusted_event_for_error(
@@ -200,34 +206,30 @@ def _version() -> str | None:
     return f'sequential-hooks {value}\n'
 
 
-def _run_text_command(arguments: tuple[str, ...], diagnostics: Diagnostics) -> int:
-    """Write top-level text or dispatch the doctor command."""
+def _run_text_command(arguments: tuple[str, ...], diagnostics: Diagnostics) -> tuple[int, str]:
+    """Render top-level text or dispatch the doctor command."""
     if arguments in {('-h',), ('--help',)}:
-        sys.stdout.write(_HELP)
-        return 0
+        return 0, _HELP
     if arguments == ('--version',):
         version = _version()
         if version is None:
             diagnostics.write_global(
                 'installed distribution metadata for sequential-hooks is unavailable'
             )
-            return 2
-        sys.stdout.write(version)
-        return 0
+            return 2, ''
+        return 0, version
     return _run_doctor_cli(arguments, diagnostics)
 
 
-def _write_response(stdout: BinaryIO, response: bytes) -> bool:
-    """Write one response, returning false after a closed downstream pipe."""
+def _write_output[T: (str, bytes)](stream: IO[T], data: T) -> None:
+    """Write and flush output, silencing standard output after downstream closure."""
     try:
-        stdout.write(response)
-        stdout.flush()
+        stream.write(data)
+        stream.flush()
     except OSError as error:
         if not is_downstream_closure(error):
             raise
         silence_descriptor(sys.stdout)
-        return False
-    return True
 
 
 def _configuration_response(
@@ -238,20 +240,18 @@ def _configuration_response(
     stdout: BinaryIO,
 ) -> int:
     """Resolve the host response before committing wrapper diagnostics."""
-    failure = CleanupState()
-    response: FinalResponse | None = None
     response_exit_code = 0
     response_stdout = b''
-    with failure:
-        response = spec.configuration_response(event, message, diagnostics)
-    if response is not None:
-        with failure:
+    try:
+        response = cast(
+            'FinalResponse | None', spec.configuration_response(event, message, diagnostics)
+        )
+        if response is not None:
             response_stdout = response.stdout
             response_exit_code = response.exit_code
-    if failure.first_error is not None:
+    except Exception as error:  # noqa: BLE001 - host plugin failure gets the last resort
         return _last_resort(
-            f'{message}; host {spec.name} configuration response failed: '
-            f'{type(failure.first_error).__name__}',
+            f'{message}; host {spec.name} configuration response failed: {type(error).__name__}',
             diagnostics,
         )
     if response is None:
@@ -259,7 +259,7 @@ def _configuration_response(
             f'{message}; host {spec.name} returned no configuration response', diagnostics
         )
     diagnostics.write_global(message)
-    _write_response(stdout, response_stdout)
+    _write_output(stdout, response_stdout)
     return response_exit_code
 
 
@@ -313,9 +313,9 @@ def _prepare_adapter(
             diagnostics,
             stdout,
         )
-    failure = CleanupState()
     adapter: HostAdapter | None = None
-    with failure:
+    failure = 'NoneType'
+    try:
         adapter = spec.adapter(
             native_context._event,
             native_context._raw_input,
@@ -323,17 +323,19 @@ def _prepare_adapter(
             diagnostics,
             allow_on_failure=invocation.allow_on_failure,
         )
-    if isinstance(failure.first_error, HostInputError):
+    except HostInputError as error:
         return _configuration_response(
             spec,
             native_context._event,
-            f'{_INVALID_INPUT_DIAGNOSTIC}: {failure.first_error}',
+            f'{_INVALID_INPUT_DIAGNOSTIC}: {error}',
             diagnostics,
             stdout,
         )
-    if failure.first_error is not None or adapter is None:
+    except Exception as error:  # noqa: BLE001 - host plugin failure gets the last resort
+        failure = type(error).__name__
+    if adapter is None:
         return _last_resort(
-            f'host {spec.name} adapter failed: {type(failure.first_error).__name__}',
+            f'host {spec.name} adapter failed: {failure}',
             diagnostics,
         )
     return adapter
@@ -348,26 +350,28 @@ def _run_chain(
 ) -> int:
     """Run the child chain and write the adapter's response."""
     executor = ProcessExecutor(diagnostics)
-    failure = CleanupState()
-    response: FinalResponse | None = None
+    chain_failed = False
     response_exit_code = 0
     response_stdout = b''
     try:
-        with executor.signal_forwarding(), failure:
-            response = run_pipeline(
-                adapter,
-                invocation.steps,
-                executor,
-                invocation.step_timeout,
-                allow_on_failure=invocation.allow_on_failure,
-            )
-            response_stdout = response.stdout
-            response_exit_code = response.exit_code
+        with executor.signal_forwarding():
+            try:
+                response = run_pipeline(
+                    adapter,
+                    invocation.steps,
+                    executor,
+                    invocation.step_timeout,
+                    allow_on_failure=invocation.allow_on_failure,
+                )
+                response_stdout = response.stdout
+                response_exit_code = response.exit_code
+            except Exception:  # noqa: BLE001 - any chain failure gets the last resort
+                chain_failed = True
     except ForwardedSignal as error:
         return 128 + error.signum
-    if failure.first_error is not None or response is None:
+    if chain_failed:
         return _last_resort(_INTERNAL_FAILURE_DIAGNOSTIC, diagnostics)
-    _write_response(stdout, response_stdout)
+    _write_output(stdout, response_stdout)
     return response_exit_code
 
 
@@ -416,6 +420,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Hook mode exchanges native bytes; help, version, and doctor write text to
     stdout. Downstream closure is absorbed while preserving the command status.
+    Without standard output at startup, nothing runs, one diagnostic line goes
+    to stderr, and the status is 2.
 
     Args:
         argv: Tokens after the executable name, or `None` for `sys.argv[1:]`.
@@ -430,9 +436,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     diagnostics = Diagnostics(sys.stderr)
+    if sys.stdout is None:
+        # Started with standard output closed: no text or host response can
+        # be delivered, so run nothing and answer as the last resort does.
+        return _last_resort('standard output is unavailable', diagnostics)
     if _is_text_command(arguments):
-        with closable_stdout():
-            return _run_text_command(arguments, diagnostics)
+        status, text = _run_text_command(arguments, diagnostics)
+        _write_output(sys.stdout, text)
+        return status
     try:
         invocation = parse_hook_argv(arguments)
     except InvocationError as error:

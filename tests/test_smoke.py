@@ -15,6 +15,37 @@ from tests._helpers import (
 _CHILD = Path(__file__).parent / 'fixtures' / 'hook_child.py'
 
 
+class TestClosedOutput:
+    @staticmethod
+    def _run(case: str) -> subprocess.CompletedProcess[bytes]:
+        if case == 'help-after-first-line':
+            return run_closing_after_first_line(['--help'])
+        if case == 'help':
+            return run_with_closed_output(['--help'])
+        depth = 600
+        payload = (
+            b'{"hook_event_name":"PreToolUse","tool_name":"probe","tool_input":'
+            + b'{"k":' * depth
+            + b'{}'
+            + b'}' * depth
+            + b'}'
+        )
+        return run_with_closed_output(['--agent', 'claude', 'unused-child'], stdin=payload)
+
+    @pytest.mark.parametrize('case', ['hook-response', 'help', 'help-after-first-line'])
+    def test_closure_is_quiet_and_preserves_status(self, case: str) -> None:
+        result = self._run(case)
+        transcript = process_transcript(result)
+        assert b'Traceback' not in result.stderr, transcript
+        assert b'Exception ignored' not in result.stderr, transcript
+        assert result.returncode == 0, transcript
+
+    def test_diagnostics_closed_stderr_preserves_status(self) -> None:
+        result = run_with_closed_output(['--agent', 'missing', 'child'], closed='stderr')
+        assert result.returncode == 2, process_transcript(result)
+        assert result.stdout == b'', process_transcript(result)
+
+
 def _child(mode: str, *args: str) -> list[str]:
     return [sys.executable, str(_CHILD), mode, *args]
 
@@ -39,6 +70,7 @@ def _native_input(host: str, event: str) -> bytes:
     return _encoded(payload)
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_antigravity_explicit_null_post_skips_child(tmp_path: Path) -> None:
     marker = tmp_path / 'explicit-null'
 
@@ -59,6 +91,7 @@ def test_antigravity_explicit_null_post_skips_child(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_antigravity_missing_tool_call_post_runs_child(tmp_path: Path) -> None:
     marker = tmp_path / 'missing-tool-call'
 
@@ -79,6 +112,7 @@ def test_antigravity_missing_tool_call_post_runs_child(tmp_path: Path) -> None:
     assert marker.read_text(encoding='utf-8') == 'ran'
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_antigravity_silent_pre_step_yields_synthetic_allow() -> None:
     status, stdout, _stderr = invoke_cli(
         ['--agent', 'agy', '--event', 'PreToolUse', *_child('exit-without-stdin')],
@@ -89,6 +123,7 @@ def test_antigravity_silent_pre_step_yields_synthetic_allow() -> None:
     assert stdout == b'{"decision":"allow"}\n'
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_child_stderr_is_labeled_and_never_enters_stdout() -> None:
     status, stdout, stderr = invoke_cli(
         ['--agent', 'agy', '--event', 'PreToolUse', *_child('stderr', 'private detail')],
@@ -101,6 +136,7 @@ def test_child_stderr_is_labeled_and_never_enters_stdout() -> None:
     assert b'private detail' not in stdout
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('decision', [[], {}])
 @pytest.mark.parametrize('allow_on_failure', [False, True])
 def test_claude_container_decision_controls_later_child(
@@ -147,41 +183,7 @@ def test_claude_container_decision_controls_later_child(
     assert 'unexpected internal failure' not in stderr
 
 
-class TestClosedOutput:
-    @staticmethod
-    def _run(case: str) -> subprocess.CompletedProcess[bytes]:
-        if case == 'help-after-first-line':
-            return run_closing_after_first_line(['--help'])
-        if case == 'help':
-            return run_with_closed_output(['--help'])
-        depth = 600
-        payload = (
-            b'{"hook_event_name":"PreToolUse","tool_name":"probe","tool_input":'
-            + b'{"k":' * depth
-            + b'{}'
-            + b'}' * depth
-            + b'}'
-        )
-        return run_with_closed_output(['--agent', 'claude', 'unused-child'], stdin=payload)
-
-    @pytest.mark.parametrize('case', ['hook-response', 'help', 'help-after-first-line'])
-    def test_closure_is_quiet(self, case: str) -> None:
-        result = self._run(case)
-        transcript = process_transcript(result)
-        assert b'Traceback' not in result.stderr, transcript
-        assert b'Exception ignored' not in result.stderr, transcript
-
-    @pytest.mark.parametrize('case', ['hook-response', 'help', 'help-after-first-line'])
-    def test_closure_preserves_status(self, case: str) -> None:
-        result = self._run(case)
-        assert result.returncode == 0, process_transcript(result)
-
-    def test_diagnostics_closed_stderr_preserves_status(self) -> None:
-        result = run_with_closed_output(['--agent', 'missing', 'child'], closed='stderr')
-        assert result.returncode == 2, process_transcript(result)
-        assert result.stdout == b'', process_transcript(result)
-
-
+@pytest.mark.usefixtures('distribution_root')
 def test_claude_pre_replacement_reaches_next_step() -> None:
     first = _encoded(
         {
@@ -215,6 +217,7 @@ def test_claude_pre_replacement_reaches_next_step() -> None:
     assert response['hookSpecificOutput']['updatedInput'] == {'command': 'replacement'}
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_codex_terminal_pre_deny_prevents_later_marker(tmp_path: Path) -> None:
     marker = tmp_path / 'later'
     deny = _encoded(
@@ -247,6 +250,7 @@ def test_codex_terminal_pre_deny_prevents_later_marker(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_hook_mode_does_not_persist_native_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -263,6 +267,7 @@ def test_hook_mode_does_not_persist_native_state(
     assert set(tmp_path.iterdir()) == before
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex', 'agy'])
 def test_post_infrastructure_failure_permits_later_marker(
     host: str,
@@ -302,6 +307,7 @@ def test_post_infrastructure_failure_permits_later_marker(
         assert stdout == b'{}\n'
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_shell_metacharacters_remain_literal(tmp_path: Path) -> None:
     marker = tmp_path / 'unintended'
     metacharacter = f'; touch {marker}'

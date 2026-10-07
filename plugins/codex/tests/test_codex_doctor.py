@@ -3,7 +3,6 @@
 import json
 import subprocess
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -16,20 +15,17 @@ from plugins.codex._sequential_hooks._doctor import (
 from sequential_hooks._doctor._command import inspect_command
 from sequential_hooks._doctor._common import analyze_registration, analyze_registration_pairs
 from sequential_hooks._registry import load_host
-from sequential_hooks.hosts import Finding, FindingSeverity, LaunchSemantics, SourceKind
+from sequential_hooks.hosts import Finding, FindingSeverity, JsonValue, LaunchSemantics, SourceKind
 
-_MALFORMED_HOOK_CASES = cast(
-    'tuple[tuple[object, str], ...]',
+_MALFORMED_HOOK_CASES: tuple[tuple[JsonValue, str], ...] = (
+    ([], 'codex_hooks_malformed'),
+    ({'PreToolUse': {}}, 'codex_event_malformed'),
+    ({'PreToolUse': [None]}, 'codex_matcher_group_malformed'),
     (
-        ([], 'codex_hooks_malformed'),
-        ({'PreToolUse': {}}, 'codex_event_malformed'),
-        ({'PreToolUse': [None]}, 'codex_matcher_group_malformed'),
-        (
-            {'PreToolUse': [{'matcher': None, 'hooks': []}]},
-            'codex_matcher_malformed',
-        ),
-        ({'PreToolUse': [{}]}, 'codex_handler_list_malformed'),
+        {'PreToolUse': [{'matcher': None, 'hooks': []}]},
+        'codex_matcher_malformed',
     ),
+    ({'PreToolUse': [{}]}, 'codex_handler_list_malformed'),
 )
 
 
@@ -685,6 +681,7 @@ hooks = false
     assert [finding.code for finding in findings] == ['codex_hook_trust_unknown']
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_stop_wrapper_reports_only_unservable_native_event(tmp_path: Path) -> None:
     source = tmp_path / '.codex/hooks.json'
     _write_json(

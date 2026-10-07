@@ -52,11 +52,11 @@ _WINDOWS_RUNTIME_CRASH_RANGE_START = 0xE0000000
 class ForwardedSignal(BaseException):
     """Report a wrapper signal after its active child has been cleaned up.
 
-    Attributes:
-        signum: Native signal number received by the wrapper.
-
     The executor raises this boundary exception at most once per signal-
     forwarding context and only after active-child cleanup.
+
+    Attributes:
+        signum: Native signal number received by the wrapper.
     """
 
     def __init__(self, signum: int) -> None:

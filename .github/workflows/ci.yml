@@ -18,7 +18,7 @@ on:
         type: boolean
         default: true
       full_tests:
-        description: Include slow tests on local runners
+        description: Request the full suite (all current tests also run by default)
         type: boolean
         default: false
 
@@ -35,14 +35,14 @@ permissions:
   contents: read
 
 env:
-  BIOME_VERSION: 2.5.4
+  BIOME_VERSION: 2.5.14
   CI_HOSTED: >-
     ${{ !github.event.repository.private || github.event_name != 'workflow_dispatch' ||
         inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER) }}
   CI_IMPORT: sequential_hooks
   UV_PYTHON_DOWNLOADS: never
   UV_SYSTEM_PYTHON: "0"
-  UV_VERSION: 0.12.13
+  UV_VERSION: 0.12.23
 
 defaults:
   run:
@@ -215,18 +215,10 @@ jobs:
           platform.python_implementation() == 'CPython'; assert sys.platform ==
           'win32'"
       - name: Run suite excluding native tiers
-        env:
-          CI_QUICK_TESTS: >-
-            ${{ runner.environment == 'self-hosted' && runner.os != 'Linux' &&
-                !inputs.full_tests }}
         run: |
-          selection=()
-          if [ "$CI_QUICK_TESTS" = true ]; then
-            selection=(-m 'not slow')
-          fi
           python -m pytest -q -n auto --dist worksteal --durations=15 \
             --ignore=tests/containment/test_posix.py \
-            --ignore=tests/containment/test_windows_native.py "${selection[@]}"
+            --ignore=tests/containment/test_windows_native.py
       - name: Run required POSIX tier
         if: runner.os == 'Linux' || runner.os == 'macOS'
         run: >-
@@ -299,7 +291,7 @@ jobs:
           sdists = list(dist.glob('*.tar.gz'))
           assert len(wheels) == 1, wheels
           assert len(sdists) == 1, sdists
-          allowed_sdist_roots = {
+          allowed_roots = {
               '_build.py', '.gitignore', 'LICENSE', 'README.md', 'PKG-INFO',
               'plugins', 'pyproject.toml', 'src',
           }
@@ -313,15 +305,15 @@ jobs:
           }
           assert len(metadata_roots) == 1, metadata_roots
           allowed_wheel_roots = {'plugins', 'sequential_hooks', *metadata_roots}
-          for archive_name, names, strip_root, allowed in (
+          for archive_name, names, strip_sdist_root, allowed in (
               (str(wheels[0]), wheel_names, False, allowed_wheel_roots),
-              (str(sdists[0]), sdist_names, True, allowed_sdist_roots),
+              (str(sdists[0]), sdist_names, True, allowed_roots),
           ):
               for raw_name in names:
                   path = PurePosixPath(raw_name)
                   assert not path.is_absolute(), (archive_name, raw_name)
                   assert '..' not in path.parts, (archive_name, raw_name)
-                  parts = path.parts[1:] if strip_root else path.parts
+                  parts = path.parts[1:] if strip_sdist_root else path.parts
                   if parts:
                       assert parts[0] in allowed, (archive_name, raw_name)
           PY

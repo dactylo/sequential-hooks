@@ -9,14 +9,17 @@ sequential-hooks doctor --agent claude
 Doctor help and reports go to stdout. Invalid doctor invocations report diagnostics on stderr.
 
 Use `codex` or `agy` for the other agents. Exit 0 means findings are informational. Exit 1 means at
-least one warning or error needs action. Exit 2 means the `doctor` invocation is invalid.
+least one warning or error is present. Exit 2 means the `doctor` invocation is invalid.
+
+Codex trust warnings persist after host-side review because `doctor` cannot inspect saved trust
+decisions. They keep the exit status at 1 even when the hook has been approved through `/hooks`.
 
 ## Registration findings
 
 | Finding                                              | Correction                                                                                                                                                                                     |
 | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `host_unavailable`                                   | Install the adapter package that registers this name in the `sequential_hooks.hosts` entry-point group, or fix its version.                                                                    |
-| `enabled_unknown`                                    | Check activation settings the report cannot inspect and confirm the hook is enabled in the host.                                                                                               |
+| `enabled_unknown`                                    | Reconcile conflicting or malformed activation settings in the inspected configuration files, following the report's correction.                                                                |
 | `wrong_host` or `host_missing`                       | Add the explicit agent name that owns the configuration file.                                                                                                                                  |
 | `event_missing` or `wrong_event`                     | For Antigravity, use the exact registered `PreToolUse` or `PostToolUse` event.                                                                                                                 |
 | `event_forbidden`                                    | Use the agent that owns the configuration and remove `--event`; Claude Code and Codex supply the event on stdin.                                                                               |
@@ -35,11 +38,11 @@ wrapper requires a real executable because generic batch argument reconstruction
 
 If Codex reports hooks it does not manage, review the active registrations with `/hooks` and remove
 any duplicate child registrations. For Antigravity event and output behavior, see the
-[host protocol](reference/host-protocols.md#antigravity). Check recorded host versions and known
-limits in [compatibility](compatibility.md), and process handling in [platforms](platforms.md).
-`doctor` reports visible enabled state and static findings; a clean report is not live-host
-verification. On Windows, remote or device executable paths are not resolved during static
-inspection; use trusted configuration and verify those commands separately.
+[host protocol](reference/host-protocols.md#antigravity). Check supported hosts and known limits in
+[compatibility](compatibility.md), and process handling in [platforms](platforms.md). `doctor`
+reports visible enabled state and static findings; a clean report is not live-host verification. On
+Windows, remote or device executable paths are not resolved during static inspection; use trusted
+configuration and verify those commands separately.
 
 ## Runtime failure categories
 
@@ -68,9 +71,8 @@ selected adapter does not serve can instead produce exit 2 with no protocol stdo
 
 The sequential-hooks Antigravity adapter rejects a successful child output containing only
 `systemMessage`. On `PreToolUse`, the default failure policy stops the chain with a deny decision.
-On `PostToolUse`, it reports the failure and continues. The current standalone defsort and docwrap
-Antigravity hooks emit such receipts, so do not add them as steps to an Antigravity chain. See
-[compatibility](compatibility.md#known-host-limits).
+On `PostToolUse`, it reports the failure and continues. Do not add a hook that emits such receipts
+as a step in an Antigravity chain. See [compatibility](compatibility.md#antigravity-limitations).
 
 Step stderr is relayed with labels and never enters protocol stdout. User-visible messages are
 short by design; use the labeled developer output for detail without copying raw host payloads.

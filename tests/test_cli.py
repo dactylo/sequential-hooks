@@ -32,13 +32,36 @@ if TYPE_CHECKING:
 _EXAMPLE_INPUT = b'{"tool":"shell","arguments":{"command":"echo hi"}}\n'
 _EXPECTED_DOCTOR_HELP = (
     'usage: sequential-hooks doctor --agent NAME\n'
-    '       sequential-hooks doctor --help\n'
     '\n'
-    'Check coding-agent configuration and platform containment support.\n'
+    "Check an agent's hook configuration and platform containment support without\n"
+    'changing anything.\n'
     '\n'
     'options:\n'
-    '  -a, --agent NAME          registered coding agent\n'
-    '  -h, --help\n'
+    '  -h, --help              show this help message and exit\n'
+    '  -a, --agent NAME        coding agent, such as agy, claude, or codex\n'
+)
+_EXPECTED_HELP = (
+    'usage: sequential-hooks --agent NAME [options] STEP [ARG ...] [-- STEP [ARG ...]] ...\n'
+    '       sequential-hooks doctor --agent NAME\n'
+    '\n'
+    'Run up to three hook commands in order as one coding-agent hook.\n'
+    '\n'
+    'options:\n'
+    '  -h, --help              show this help message and exit\n'
+    '  --version               show the version and exit\n'
+    '  -a, --agent NAME        coding agent, such as agy, claude, or codex\n'
+    '  -e, --event EVENT       hook event, for agents whose payload omits it (agy)\n'
+    '  --step-timeout SECONDS  time limit for each step (default: none)\n'
+    '  --allow-on-failure      on pre-tool events, report a failed step and continue\n'
+    '                          instead of blocking; on any event, run a step without\n'
+    '                          containment when containment cannot be set up\n'
+    '\n'
+    'Separate steps with --; no step receives -- as an argument. Each step receives\n'
+    "the agent's payload, as updated by earlier steps, and only its own arguments.\n"
+    'Put wrapper options before the first step.\n'
+    '\n'
+    'example:\n'
+    '  sequential-hooks --agent claude first-hook --check -- second-hook\n'
 )
 
 
@@ -47,16 +70,6 @@ class _BrokenFlushFileDescriptorTextIO(io.StringIO):
         return -1
 
     def flush(self) -> None:
-        raise BrokenPipeError
-
-
-class _BrokenFlushNoFileDescriptorTextIO(io.StringIO):
-    def __init__(self) -> None:
-        super().__init__()
-        self.flushes = 0
-
-    def flush(self) -> None:
-        self.flushes += 1
         raise BrokenPipeError
 
 
@@ -81,18 +94,6 @@ class _BrokenOutput(io.BytesIO):
 class _BrokenPipeTextIO(io.StringIO):
     def write(self, _value: str) -> int:
         raise BrokenPipeError
-
-
-class _BrokenSecondWriteTextIO(io.StringIO):
-    def __init__(self) -> None:
-        super().__init__()
-        self.writes = 0
-
-    def write(self, value: str) -> int:
-        self.writes += 1
-        if self.writes == 2:
-            raise BrokenPipeError
-        return super().write(value)
 
 
 class _BrokenWriteTextIO(io.StringIO):
@@ -206,6 +207,21 @@ def _native_input(host: str, event: str) -> bytes:
     return f'{json.dumps(payload, separators=(",", ":"))}\n'.encode()
 
 
+def _option_descriptions(help_text: str) -> dict[str, str]:
+    lines = help_text.splitlines()
+    descriptions: dict[str, str] = {}
+    option = ''
+    for line in lines[lines.index('options:') + 1 :]:
+        if not line.startswith('  '):
+            break
+        if line.startswith('  -'):
+            option, _separator, description = line.strip().partition('  ')
+            descriptions[option] = description.strip()
+        else:
+            descriptions[option] = f'{descriptions[option]} {line.strip()}'
+    return descriptions
+
+
 def _raise_invariant(*_args: object, **_kwargs: object) -> NativeResponse:
     raise RuntimeError('broken invariant')
 
@@ -263,6 +279,33 @@ def _safe_response(host: str, event: str) -> bytes:
     return responses[(host, event)]
 
 
+def _starts_in_lowercase_style(text: str) -> bool:
+    first = text.split(maxsplit=1)[0]
+    is_acronym = first.upper() == first and any(character.isalpha() for character in first)
+    return text[0].islower() or is_acronym
+
+
+def test_adapter_returning_none_uses_last_resort(
+    example_hosts: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del example_hosts
+
+    def return_none(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(ExampleHost, 'adapter', return_none)
+
+    status, stdout, stderr = invoke_cli(
+        ['--agent', 'example', '--event', 'BeforeTool', 'child'],
+        io.BytesIO(_EXAMPLE_INPUT),
+    )
+
+    assert (status, stdout) == (2, b'')
+    assert stderr == 'sequential-hooks: host example adapter failed: NoneType\n'
+
+
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('event', ['PreToolUse', 'PostToolUse'])
 def test_antigravity_configuration_error_event_authority_uses_argv(event: str) -> None:
     raw_input = (
@@ -279,6 +322,7 @@ def test_antigravity_configuration_error_event_authority_uses_argv(event: str) -
     assert stdout == _safe_response('agy', event)
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('event', ['PreToolUse', 'PostToolUse'])
 def test_antigravity_event_after_syntax_error_uses_last_resort(event: str) -> None:
     status, stdout, stderr = invoke_cli(
@@ -293,6 +337,7 @@ def test_antigravity_event_after_syntax_error_uses_last_resort(event: str) -> No
     )
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('argv', 'expected'),
     [
@@ -310,6 +355,7 @@ def test_antigravity_without_a_trusted_event_uses_the_last_resort(
     assert expected in stderr
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_broken_pipe_writes_no_second_response(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_cli, 'run_pipeline', _return_empty_response)
     stdout = _BrokenOutput()
@@ -348,6 +394,7 @@ def test_cli_import_stays_off_the_cold_paths() -> None:
     )
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 def test_configuration_error_event_authority_uses_stream(host: str) -> None:
     status, stdout, _stderr = invoke_cli(
@@ -359,6 +406,7 @@ def test_configuration_error_event_authority_uses_stream(host: str) -> None:
     assert stdout == _safe_response(host, 'PreToolUse')
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_configuration_error_payload_is_parsed_once_by_strict_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,6 +458,7 @@ def test_configuration_response_property_failure_uses_last_resort(
     assert len(stderr.splitlines()) == 1
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_context_dependent_failure_reads_stdin_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -430,6 +479,7 @@ def test_context_dependent_failure_reads_stdin_once(
     )
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     'argv',
     [
@@ -471,9 +521,7 @@ def test_context_free_text_uses_the_documented_streams(
         _UnreadableInput(),
     )
 
-    assert (help_status, help_stderr) == (0, '')
-    assert help_stdout.startswith(b'usage: sequential-hooks --agent NAME')
-    assert b'       sequential-hooks doctor --help\n' in help_stdout
+    assert (help_status, help_stdout, help_stderr) == (0, _EXPECTED_HELP.encode(), '')
     assert (version_status, version_stdout, version_stderr) == (
         0,
         b'sequential-hooks 9.9.9\n',
@@ -488,6 +536,7 @@ def test_context_free_text_uses_the_documented_streams(
     assert invalid_stderr == ('sequential-hooks: invalid doctor invocation; use doctor --help\n')
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('host', 'detail'),
     [
@@ -531,7 +580,9 @@ def test_doctor_cli_accepts_agent_option(host: str, monkeypatch: pytest.MonkeyPa
 
     def fake_run_doctor(selected_host: str, **kwargs: object) -> int:
         received.append(selected_host)
-        cast('io.StringIO', kwargs['stream']).write('ok\n')
+        write = getattr(kwargs['stream'], 'write', None)
+        assert callable(write)
+        write('ok\n')
         return 0
 
     monkeypatch.setattr('sequential_hooks._doctor.run_doctor', fake_run_doctor)
@@ -559,6 +610,7 @@ def test_doctor_cli_accepts_short_agent_option(monkeypatch: pytest.MonkeyPatch) 
     assert received == ['codex']
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_doctor_cli_discovers_project_configuration_from_given_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -591,7 +643,7 @@ def test_doctor_cli_discovers_project_configuration_from_given_cwd(
     )
 
     assert status == 1
-    displayed_source = str(source).encode('unicode_escape').decode('ascii')
+    displayed_source = source.as_posix().encode('unicode_escape').decode('ascii')
     assert f'- [project] {displayed_source}: exists\n'.encode() in stdout
     assert stderr == ''
     assert Path.cwd() == previous_cwd
@@ -649,6 +701,7 @@ def test_doctor_cli_injects_environment_at_text_boundary(
     }
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex', 'agy'])
 def test_doctor_cli_runs_real_report_with_synthetic_boundaries(
     host: str,
@@ -670,9 +723,9 @@ def test_doctor_cli_runs_real_report_with_synthetic_boundaries(
     assert status == 1
     assert f'agent: {host}\n' in report
     assert '\nlimitations:\n- ' in report
-    assert str(home).encode('unicode_escape').decode('ascii') in report
+    assert home.as_posix().encode('unicode_escape').decode('ascii') in report
     if host != 'agy':
-        assert str(system_root).encode('unicode_escape').decode('ascii') in report
+        assert system_root.as_posix().encode('unicode_escape').decode('ascii') in report
     assert stderr == ''
 
 
@@ -764,25 +817,6 @@ def test_doctor_help_suppresses_broken_pipe_from_text_write(
     assert stderr.getvalue() == ''
 
 
-def test_doctor_help_suppresses_broken_pipe_without_default_stdout_fileno(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stdout = _BrokenFlushNoFileDescriptorTextIO()
-    stderr = io.StringIO()
-    monkeypatch.setattr(_cli.sys, 'stdout', stdout)
-
-    monkeypatch.setattr(sys, 'stdin', io.TextIOWrapper(_UnreadableInput(), encoding='utf-8'))
-    monkeypatch.setattr(sys, 'stderr', stderr)
-
-    status = _cli.main(['doctor', '--help'])
-
-    assert status == 0
-    assert stdout.getvalue() == _EXPECTED_DOCTOR_HELP
-    assert stdout.flushes == 1
-    assert _cli.sys.stdout is not stdout
-    assert stderr.getvalue() == ''
-
-
 def test_doctor_help_uses_text_stdout_without_inspection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -825,35 +859,6 @@ def test_doctor_preserves_report_status_after_broken_text_write(
     assert stderr.getvalue() == ''
 
 
-@pytest.mark.parametrize('report_status', [1, 2])
-def test_doctor_preserves_report_status_after_broken_text_writelines(
-    report_status: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    doctor_stdout = _BrokenSecondWriteTextIO()
-    stderr = io.StringIO()
-    report_lines = iter(('first report line\n', 'closed line\n', 'discarded line\n'))
-
-    def write_report(_host: str, **kwargs: object) -> int:
-        stream = cast('DoctorOutput', kwargs['stream'])
-        stream.writelines(report_lines)
-        return report_status
-
-    monkeypatch.setattr('sequential_hooks._doctor.run_doctor', write_report)
-
-    monkeypatch.setattr(sys, 'stdin', io.TextIOWrapper(_UnreadableInput(), encoding='utf-8'))
-    monkeypatch.setattr(sys, 'stdout', doctor_stdout)
-    monkeypatch.setattr(sys, 'stderr', stderr)
-
-    status = _cli.main(['doctor', '--agent', 'claude'])
-
-    assert status == report_status
-    assert doctor_stdout.getvalue() == 'first report line\n'
-    assert doctor_stdout.writes == 2
-    assert list(report_lines) == ['discarded line\n']
-    assert stderr.getvalue() == ''
-
-
 def test_doctor_system_root_keeps_posix_anchor() -> None:
     checkout = Path('/work/project')
 
@@ -889,6 +894,43 @@ def test_doctor_system_root_uses_windows_machine_location(
     assert PureWindowsPath(root) == expected
 
 
+@pytest.mark.parametrize(
+    ('help_text', 'options'),
+    [
+        (
+            _cli._HELP,
+            [
+                '-h, --help',
+                '--version',
+                '-a, --agent NAME',
+                '-e, --event EVENT',
+                '--step-timeout SECONDS',
+                '--allow-on-failure',
+            ],
+        ),
+        (_cli._DOCTOR_HELP, ['-h, --help', '-a, --agent NAME']),
+    ],
+    ids=['hook', 'doctor'],
+)
+def test_every_help_option_has_a_lowercase_description(
+    help_text: str,
+    options: list[str],
+) -> None:
+    descriptions = _option_descriptions(help_text)
+    problems = [
+        f'{option}: {description!r}'
+        for option, description in descriptions.items()
+        if (
+            not description
+            or not _starts_in_lowercase_style(description)
+            or description.endswith('.')
+        )
+    ]
+    assert list(descriptions) == options
+    assert problems == []
+
+
+@pytest.mark.usefixtures('distribution_root')
 def test_forwarded_signal_returns_shell_status(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_cli, 'run_pipeline', _raise_signal)
 
@@ -901,6 +943,7 @@ def test_forwarded_signal_returns_shell_status(monkeypatch: pytest.MonkeyPatch) 
     assert stdout == b''
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_hook_invocation_does_not_read_version_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden_version(_distribution: str) -> str:
         raise AssertionError('hook invocation read version metadata')
@@ -949,6 +992,7 @@ def test_invalid_doctor_syntax_returns_two_without_inspection_or_stdin(
     assert stderr == 'sequential-hooks: invalid doctor invocation; use doctor --help\n'
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_invalid_native_input_does_not_expose_payload_text() -> None:
     sentinel = 'PAYLOAD_PRIVATE_SECRET_' + ('z' * 20_000)
     raw_input = _native_input('claude', 'PostToolUse').replace(
@@ -972,6 +1016,7 @@ def test_invalid_native_input_does_not_expose_payload_text() -> None:
     assert sentinel not in stderr
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('host', 'event'),
     [
@@ -999,6 +1044,7 @@ def test_invalid_native_input_produces_one_safe_response(host: str, event: str) 
     assert stdout.count(b'\n') == 1
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_invariant_secret_is_absent_from_last_resort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1048,6 +1094,7 @@ def test_invoke_cli_decodes_text_stdin_as_utf8_with_non_utf8_default(
     assert stderr == ''
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_known_antigravity_context_translates_invalid_wrapper_syntax() -> None:
     status, stdout, _stderr = invoke_cli(
         ['--agent', 'agy', '--event', 'PostToolUse', '--unknown'],
@@ -1058,6 +1105,7 @@ def test_known_antigravity_context_translates_invalid_wrapper_syntax() -> None:
     assert stdout == b'{}\n'
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 def test_known_host_without_stream_event_is_context_error(host: str) -> None:
     status, stdout, stderr = invoke_cli(
@@ -1070,6 +1118,7 @@ def test_known_host_without_stream_event_is_context_error(host: str) -> None:
     assert 'event' in stderr
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 @pytest.mark.parametrize('agent_before_error', [False, True])
 def test_known_stream_event_translates_invalid_wrapper_syntax(
@@ -1184,6 +1233,7 @@ def test_multiline_host_factory_failure_is_one_visible_diagnostic(
     )
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_oversized_native_integer_returns_status_without_traceback() -> None:
     raw_input = (
         b'{"hook_event_name":"PreToolUse","tool_name":"Bash",'
@@ -1251,13 +1301,11 @@ def test_parse_hook_argv_accepts_agent_option() -> None:
             'codex',
             '--step-timeout',
             '30',
-            'defsort',
-            'hook',
+            'first-hook',
             '--agent',
             'codex',
             '--',
-            'docwrap',
-            'hook',
+            'second-hook',
             '--agent',
             'codex',
         ]
@@ -1265,8 +1313,8 @@ def test_parse_hook_argv_accepts_agent_option() -> None:
 
     assert invocation.host == 'codex'
     assert invocation.step_timeout == 30
-    assert invocation.steps[0].argv == ('defsort', 'hook', '--agent', 'codex')
-    assert invocation.steps[1].argv == ('docwrap', 'hook', '--agent', 'codex')
+    assert invocation.steps[0].argv == ('first-hook', '--agent', 'codex')
+    assert invocation.steps[1].argv == ('second-hook', '--agent', 'codex')
 
 
 def test_parse_hook_argv_accepts_short_agent_option() -> None:
@@ -1368,6 +1416,7 @@ def test_payload_event_failure_uses_last_resort_on_each_resolution_path(
     assert 'host unresolvable-event event resolution failed: RuntimeError' in stderr
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 def test_payload_hosts_reject_an_explicit_event_through_tier_two(host: str) -> None:
     raw_input = b'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}\n'
@@ -1381,6 +1430,7 @@ def test_payload_hosts_reject_an_explicit_event_through_tier_two(host: str) -> N
     assert f'sequential-hooks: --event is not accepted for host {host}\n' in stderr
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 def test_payload_hosts_without_a_trusted_event_use_the_last_resort(host: str) -> None:
     status, stdout, stderr = invoke_cli(
@@ -1391,6 +1441,7 @@ def test_payload_hosts_without_a_trusted_event_use_the_last_resort(host: str) ->
     assert stderr == 'sequential-hooks: native event could not be established\n'
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 def test_post_event_translates_invalid_wrapper_syntax_exactly(
     host: str,
@@ -1505,10 +1556,11 @@ def test_short_help_options_use_the_documented_streams(
     monkeypatch.setattr('sequential_hooks._doctor.run_doctor', fail_inspection)
     doctor_status, doctor_stdout, doctor_stderr = invoke_cli(['doctor', '-h'], _UnreadableInput())
 
-    assert (help_status, help_stdout, help_stderr) == (0, _cli._HELP.encode(), '')
+    assert (help_status, help_stdout, help_stderr) == (0, _EXPECTED_HELP.encode(), '')
     assert (doctor_status, doctor_stdout, doctor_stderr) == (0, _EXPECTED_DOCTOR_HELP.encode(), '')
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_translate_error_writes_response_despite_broken_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1528,6 +1580,39 @@ def test_translate_error_writes_response_despite_broken_diagnostics(
     assert status == 0
 
 
+@pytest.mark.parametrize(
+    'argv',
+    [
+        ['--help'],
+        ['--version'],
+        ['doctor', '--help'],
+        ['doctor', '--agent', 'claude'],
+        ['--agent', 'claude', 'first-hook'],
+        ['--agent', 'claude', '--bogus'],
+    ],
+    ids=['help', 'version', 'doctor-help', 'doctor', 'hook', 'invalid-hook'],
+)
+def test_unavailable_stdout_runs_nothing_and_exits_two(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError('work started without standard output')
+
+    stderr = io.StringIO()
+    monkeypatch.setattr('sequential_hooks._doctor.run_doctor', fail)
+    monkeypatch.setattr(_cli, 'load_host', fail)
+    monkeypatch.setattr(sys, 'stdin', io.TextIOWrapper(_UnreadableInput(), encoding='utf-8'))
+    monkeypatch.setattr(sys, 'stdout', None)
+    monkeypatch.setattr(sys, 'stderr', stderr)
+
+    status = _cli.main(argv)
+
+    assert status == 2
+    assert stderr.getvalue() == 'sequential-hooks: standard output is unavailable\n'
+
+
+@pytest.mark.usefixtures('distribution_root')
 def test_unexpected_failure_with_context_uses_last_resort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1543,6 +1628,7 @@ def test_unexpected_failure_with_context_uses_last_resort(
     assert stderr == 'sequential-hooks: unexpected internal failure\n'
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_unknown_option_secret_is_absent_from_translated_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1564,6 +1650,7 @@ def test_unknown_option_secret_is_absent_from_translated_response(
     assert sentinel not in stderr
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('failure_option', [[], ['--allow-on-failure']])
 def test_valid_explicit_null_antigravity_post_tool_skips_child(
     failure_option: list[str],
@@ -1588,6 +1675,7 @@ def test_valid_explicit_null_antigravity_post_tool_skips_child(
     assert stderr == ''
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_valid_hook_reads_stdin_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_cli, 'run_pipeline', _return_empty_response)
     stdin = _CountingInput(_native_input('agy', 'PostToolUse'))
@@ -1603,6 +1691,7 @@ def test_valid_hook_reads_stdin_once(monkeypatch: pytest.MonkeyPatch) -> None:
     assert stderr == ''
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_valid_native_payload_is_parsed_once_by_strict_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

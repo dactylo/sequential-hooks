@@ -66,17 +66,8 @@ class _RankedContribution:
     _step: Step
 
 
-class AgyAdapter:
-    """Compose child results for one validated Antigravity event.
-
-    Child results are consumed in step order and composed into an event-
-    specific final response. The original strict JSON input remains the input
-    for every child.
-
-    Attributes:
-        event: Validated pre-tool or post-tool event.
-        should_run_steps: Whether the invocation should execute child steps.
-    """
+class _AgyAdapter:
+    """Compose child results for one validated Antigravity event."""
 
     def __init__(
         self,
@@ -87,19 +78,7 @@ class AgyAdapter:
         *,
         allow_on_failure: bool,
     ) -> None:
-        """Validate native input and initialize one Antigravity event adapter.
-
-        Args:
-            event: Exact CLI event selected by the caller.
-            raw_input: Original strict JSON bytes received from Antigravity.
-            payload: Decoded strict JSON object matching `raw_input`.
-            diagnostics: Developer-tier diagnostic sink.
-            allow_on_failure: Whether approved pre-tool failures may continue.
-
-        Raises:
-            HostInputError: If required Antigravity input is missing, has the
-                wrong type, or is invalid.
-        """
+        """Validate native input and initialize one Antigravity event adapter."""
         if event not in _EVENTS:
             raise HostInputError('Antigravity input has an unsupported event')
         step_index = payload.get('stepIdx')
@@ -487,7 +466,7 @@ class AgyHost:
         diagnostics: Diagnostics,
         *,
         allow_on_failure: bool,
-    ) -> AgyAdapter:
+    ) -> _AgyAdapter:
         """Validate native input and construct the adapter for one invocation.
 
         Args:
@@ -503,7 +482,7 @@ class AgyHost:
         Raises:
             HostInputError: If the payload is not valid input for `event`.
         """
-        return AgyAdapter(
+        return _AgyAdapter(
             event,
             raw_input,
             payload,

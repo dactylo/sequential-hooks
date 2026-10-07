@@ -13,15 +13,15 @@ if TYPE_CHECKING:
 class CleanupState:
     """Retain the first failure while attempting every cleanup action.
 
-    Attributes:
-        first_error: First ordinary exception recorded during the pass, or the
-            supplied earlier failure.
-
     Each instance represents one cleanup pass. Entering returns the same
     cleanup state and resets only the current action result. The context
     manager retains and suppresses ordinary exceptions so later actions can
     run, but it does not suppress other `BaseException` subclasses. Create a
     new instance for each new pass.
+
+    Attributes:
+        first_error: First ordinary exception recorded during the pass, or the
+            supplied earlier failure.
     """
 
     def __init__(self, first_error: Exception | None = None) -> None:

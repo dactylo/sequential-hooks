@@ -1,4 +1,3 @@
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,45 +9,13 @@ from sequential_hooks._doctor._common import (
     analyze_registration_pairs,
     inspect_platform,
 )
-from sequential_hooks._doctor._types import (
-    ConfigSource,
-    FindingSeverity,
-    LaunchSemantics,
-    Registration,
-    SourceKind,
-)
 from sequential_hooks._executable import ExecutableResolution, ExecutableStatus
 from sequential_hooks._registry import load_host
+from sequential_hooks.hosts import FindingSeverity, LaunchSemantics
+from tests.doctor._helpers import registration as _registration
 
 
-def _registration(
-    command: str = 'sequential-hooks --agent codex child',
-    **changes: object,
-) -> Registration:
-    if 'semantics' in changes:
-        changes['launch_semantics'] = changes.pop('semantics')
-    if 'windows_semantics' in changes:
-        changes['windows_launch_semantics'] = changes.pop('windows_semantics')
-    registration = Registration(
-        source=ConfigSource(
-            path=Path('/safe/config.json'),
-            kind=SourceKind.USER,
-            exists=True,
-        ),
-        event='PostToolUse',
-        matcher=None,
-        command=command,
-        args=None,
-        launch_semantics=LaunchSemantics.POSIX_SHELL,
-        command_windows=None,
-        windows_launch_semantics=None,
-        timeout=30.0,
-        enabled=True,
-        type=None,
-    )
-    return replace(registration, **changes)
-
-
+@pytest.mark.usefixtures('distribution_root')
 def test_analysis_preserves_registration_and_pair_finding_order(
     tmp_path: Path,
 ) -> None:
@@ -110,6 +77,7 @@ def test_analysis_preserves_registration_and_pair_finding_order(
     ]
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_analysis_reports_event_and_uninspectable_states() -> None:
     registrations = (
         _registration(
@@ -146,6 +114,7 @@ def test_analysis_reports_event_and_uninspectable_states() -> None:
     assert 'registration_disabled' in codes
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_analysis_reports_missing_executables_and_literal_child_duplicate(
     tmp_path: Path,
 ) -> None:
@@ -179,6 +148,32 @@ def test_analysis_reports_missing_executables_and_literal_child_duplicate(
     assert 'duplicate_child_registration' in codes
 
 
+@pytest.mark.usefixtures('distribution_root')
+def test_analysis_reports_unknown_activation_for_an_unrecognized_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = load_host('codex')
+    monkeypatch.setattr(spec, 'name', 'third-party')
+    registration = _registration('literal-child', enabled=None)
+
+    findings = analyze_registration(
+        spec,
+        (registration, inspect_command(registration, windows=False)),
+        path_value=str(tmp_path),
+        path_ext=None,
+        windows=False,
+    )
+
+    unknowns = [finding for finding in findings if finding.code == 'enabled_unknown']
+    assert len(unknowns) == 1
+    assert unknowns[0].severity is FindingSeverity.WARNING
+    assert unknowns[0].correction == (
+        'Reconcile hook activation settings in the discovered sources.'
+    )
+
+
+@pytest.mark.usefixtures('distribution_root')
 def test_analysis_reports_wrapper_contract_and_duplicates(tmp_path: Path) -> None:
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
@@ -286,6 +281,7 @@ def test_duplicate_wrapper_requires_repeated_event_and_matcher() -> None:
     assert codes.count('definite_matcher_overlap') == 1
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     'command',
     [
@@ -313,6 +309,7 @@ def test_event_forbidden_correction_repairs_wrong_host_in_one_edit(
     assert matching[0].correction == ('Use --agent claude and remove the --event option.')
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     'command',
     [
@@ -355,6 +352,7 @@ def test_malformed_wrapper_prefix_remains_uninspectable(command: str) -> None:
     }.intersection(codes)
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_partial_wrapper_context_does_not_read_child_options() -> None:
     registration = _registration('sequential-hooks child --agent unknown')
     findings = analyze_registration(
@@ -373,6 +371,7 @@ def test_partial_wrapper_context_does_not_read_child_options() -> None:
     assert host_missing.message == 'wrapper agent is missing'
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('host', 'command', 'event', 'code', 'correction'),
     [
@@ -494,6 +493,7 @@ def test_regex_overlap_is_not_executed_or_claimed_definite() -> None:
     assert overlap[0].severity is FindingSeverity.INFO
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_windows_batch_shim_finding_is_bounded_and_sanitized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -555,6 +555,7 @@ def test_windows_batch_shim_finding_is_bounded_and_sanitized(
     assert len(unsupported[0].correction or '') <= 120
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_windows_child_shim_redacts_requested_name_and_directory(tmp_path: Path) -> None:
     directory_sentinel = 'private-directory-sentinel'
     input_sentinel = f'private-input-sentinel-{"x" * 100}'

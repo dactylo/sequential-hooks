@@ -10,13 +10,8 @@ from itertools import pairwise
 from pathlib import Path, PureWindowsPath
 
 from sequential_hooks._arguments import InvocationError, parse_hook_argv
-from sequential_hooks._doctor._types import (
-    ContractError,
-    InspectedCommand,
-    LaunchSemantics,
-    Registration,
-)
 from sequential_hooks._registry import host_requirements
+from sequential_hooks.hosts import ContractError, InspectedCommand, LaunchSemantics, Registration
 
 _ENVIRONMENT_PREFIX = re.compile(r'^\s*[A-Za-z_][A-Za-z0-9_]*=')
 _NEGATION_PREFIX = re.compile(r'^\s*!(?:\s|$)')
@@ -444,7 +439,7 @@ def inspect_command(
 
 def is_windows_remote_executable(executable: str) -> bool:
     """Identify explicit Windows UNC or device tokens without filesystem access."""
-    return executable.replace('\\', '/').startswith('//')
+    return executable.replace('/', '\\').startswith(('\\\\', '\\??\\'))
 
 
 def redact_command(registration: Registration, *, windows: bool = False) -> str:

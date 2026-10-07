@@ -3,7 +3,7 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, BinaryIO, TextIO, cast
 
 import pytest
@@ -17,18 +17,17 @@ from sequential_hooks._doctor import (
     run_doctor,
 )
 from sequential_hooks._doctor._command import inspect_command
-from sequential_hooks._doctor._types import (
+from sequential_hooks._doctor._types import DoctorReport, PlatformReport
+from sequential_hooks._executable import ExecutableResolution, ExecutableStatus
+from sequential_hooks.hosts import (
     ConfigSource,
-    DoctorReport,
     Finding,
     FindingSeverity,
     InspectedCommand,
     LaunchSemantics,
-    PlatformReport,
     Registration,
     SourceKind,
 )
-from sequential_hooks._executable import ExecutableResolution, ExecutableStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -127,7 +126,7 @@ def _create_executable(path: Path) -> None:
 
 
 def _escaped_path(path: Path) -> str:
-    return str(path).encode('unicode_escape').decode('ascii')
+    return path.as_posix().encode('unicode_escape').decode('ascii')
 
 
 def _guard_doctor_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -212,7 +211,10 @@ def _normalize_report_paths(output: str, report: DoctorReport, root: Path) -> st
                     raw_line = f'{prefix}{rendered_message}\n'
                     normalized_intro = f'{host_label} configuration at {replacements[raw]} '
                     path_lines[raw_line] = raw_line.replace(
-                        f'{host_label} configuration at {raw} ', normalized_intro, 1
+                        f'{host_label} configuration at '
+                        f'{str(source.path).encode("unicode_escape").decode("ascii")} ',
+                        normalized_intro,
+                        1,
                     )
     return ''.join(path_lines.get(line, line) for line in output.splitlines(keepends=True))
 
@@ -297,6 +299,7 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value))
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('commands', 'executables', 'expected_code'),
     [
@@ -381,6 +384,7 @@ def test_codex_static_commands_reach_documented_findings(
     assert expected_code in {finding.code for finding in report.findings}
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_doctor_is_read_only_and_process_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -410,17 +414,7 @@ def test_doctor_is_read_only_and_process_free(
     before_content = source.read_bytes()
     before_metadata = source.stat()
 
-    def fail_operation(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError('doctor performed a forbidden operation')
-
-    monkeypatch.setattr(Path, 'write_bytes', fail_operation)
-    monkeypatch.setattr(Path, 'write_text', fail_operation)
-    monkeypatch.setattr(os, 'system', fail_operation)
-    monkeypatch.setattr(subprocess, 'Popen', fail_operation)
-    monkeypatch.setattr(subprocess, 'call', fail_operation)
-    monkeypatch.setattr(subprocess, 'check_call', fail_operation)
-    monkeypatch.setattr(subprocess, 'check_output', fail_operation)
-    monkeypatch.setattr(subprocess, 'run', fail_operation)
+    _guard_doctor_side_effects(monkeypatch)
 
     report = _inspect_host(
         'claude',
@@ -443,6 +437,7 @@ def test_doctor_is_read_only_and_process_free(
     assert 'private-value' not in stream.getvalue()
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_doctor_reports_an_unloadable_host_as_a_finding(tmp_path: Path) -> None:
     stream = io.StringIO()
 
@@ -463,6 +458,7 @@ def test_doctor_reports_an_unloadable_host_as_a_finding(tmp_path: Path) -> None:
     assert 'sequential_hooks.hosts entry-point group' in report
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_documented_claude_registration_is_not_actionable(tmp_path: Path) -> None:
     home = tmp_path / 'home'
     cwd = tmp_path / 'work'
@@ -513,6 +509,7 @@ def test_documented_claude_registration_is_not_actionable(tmp_path: Path) -> Non
     assert 'enabled_unknown' not in stream.getvalue()
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize('explicit_timeout', [True, False])
 def test_inspect_agy_groups_findings_by_hook(
     tmp_path: Path,
@@ -606,6 +603,7 @@ def test_inspect_agy_groups_findings_by_hook(
     assert rendered_codes == expected
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_agy_keeps_windows_shell_contract_uninspectable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -652,6 +650,7 @@ def test_inspect_agy_keeps_windows_shell_contract_uninspectable(
     assert 'wrong_event' not in codes
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_agy_prioritizes_wrong_host_over_embedded_event_rule(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -700,6 +699,7 @@ def test_inspect_agy_prioritizes_wrong_host_over_embedded_event_rule(
     assert 'event_forbidden' not in [finding.code for finding in report.findings]
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_and_render_agy_exactly_without_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -788,6 +788,7 @@ def test_inspect_and_render_agy_exactly_without_side_effects(
     assert _tree_snapshot(roots) == before
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_and_render_claude_exactly_without_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -958,6 +959,7 @@ def test_inspect_and_render_claude_exactly_without_side_effects(
     assert _tree_snapshot(roots) == before
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_and_render_codex_exactly_without_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1075,6 +1077,7 @@ def test_inspect_and_render_codex_exactly_without_side_effects(
     assert _tree_snapshot(roots) == before
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_host_appends_common_findings_with_exact_corrections(
     tmp_path: Path,
 ) -> None:
@@ -1145,6 +1148,7 @@ def test_inspect_host_appends_common_findings_with_exact_corrections(
     )
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     ('host', 'relative_path', 'document', 'event'),
     _DISPATCH_CASES,
@@ -1180,16 +1184,12 @@ def test_inspect_host_dispatches_each_loader(
     assert report.executable == executable_directory / f'sequential-hooks{suffix}'
     assert report.version == '0.0.0'
     assert any(source.path == home / relative_path and source.exists for source in report.sources)
-    if host == 'agy':
-        assert [
-            (registration.event, registration.type) for registration in report.registrations
-        ] == [(event, 'command')]
-    else:
-        assert [
-            (registration.event, registration.type) for registration in report.registrations
-        ] == [(event, 'command')]
+    assert [(registration.event, registration.type) for registration in report.registrations] == [
+        (event, 'command')
+    ]
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_inspect_host_inspects_each_registration_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1234,7 +1234,7 @@ def test_inspect_host_inspects_each_registration_once(
 
 
 def test_render_report_escapes_every_dynamic_scalar() -> None:
-    separator = '\\\\' if os.name == 'nt' else '/'
+    separator = '/'
     source = ConfigSource(Path('/config\ninjected.json'), SourceKind.USER, exists=True)
     registration = Registration(
         source=source,
@@ -1329,7 +1329,10 @@ def test_render_report_header_explains_ascii_backslash_escapes() -> None:
         r'display: ASCII backslash escapes; \\ represents one literal backslash',
         'agent: claude',
     ]
-    assert 'wrapper: C:\\\\Tools\\\\sequential-hooks.exe\n' in stream.getvalue()
+    expected = (
+        'C:/Tools/sequential-hooks.exe' if os.name == 'nt' else r'C:\\Tools\\sequential-hooks.exe'
+    )
+    assert f'wrapper: {expected}\n' in stream.getvalue()
 
 
 def test_render_report_is_exact_and_redaction_safe(tmp_path: Path) -> None:
@@ -1482,7 +1485,7 @@ def test_render_report_uses_redacted_active_windows_command(
 
 
 def test_render_report_writes_ascii_safe_code_point_escapes() -> None:
-    separator = '\\\\' if os.name == 'nt' else '/'
+    separator = '/'
     raw_stream = io.BytesIO()
     stream = io.TextIOWrapper(raw_stream, encoding='ascii')
     report = DoctorReport(
@@ -1581,7 +1584,7 @@ def test_snapshot_normalizes_only_known_path_fields(tmp_path: Path) -> None:
 
     output = _normalize_report_paths(stream.getvalue(), report, root)
 
-    escaped = _escaped_path(source.path)
+    escaped = raw_path.encode('unicode_escape').decode('ascii')
     assert '\\xe9' in escaped
     assert 'wrapper: $ROOT/bin/sequential-hooks\n' in output
     assert '- [user] $ROOT/settings.json: exists\n' in output
@@ -1596,6 +1599,7 @@ def test_snapshot_normalizes_only_known_path_fields(tmp_path: Path) -> None:
     assert f'- raw {escaped}\n' in output
 
 
+@pytest.mark.usefixtures('distribution_root')
 def test_windows_probe_resolves_real_wrapper_rejects_shim_and_never_assigns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1655,6 +1659,7 @@ def test_windows_probe_resolves_real_wrapper_rejects_shim_and_never_assigns(
     )
 
 
+@pytest.mark.usefixtures('distribution_root')
 @pytest.mark.parametrize(
     'token',
     [
@@ -1662,6 +1667,9 @@ def test_windows_probe_resolves_real_wrapper_rejects_shim_and_never_assigns(
         '//private-server/share/sequential-hooks.exe',
         r'\\?\C:\private-device\sequential-hooks.exe',
         r'\\.\private-device\sequential-hooks.exe',
+        r'\??\UNC\private-server\share\sequential-hooks.exe',
+        '/??/UNC/private-server/share/sequential-hooks.exe',
+        r'\??\C:\private-device\sequential-hooks.exe',
     ],
 )
 @pytest.mark.parametrize('position', ['registered', 'wrapper', 'child'])
@@ -1734,3 +1742,44 @@ def test_windows_remote_tokens_are_unresolved_and_redacted(
     assert token not in output
     assert 'command_uninspectable' in output
     assert 'local-control' in output
+
+
+@pytest.mark.parametrize(
+    ('path', 'expected'),
+    [
+        (PureWindowsPath('C:/repo/config.json'), 'C:/repo/config.json'),
+        (PureWindowsPath('//server/share/config.json'), '//server/share/config.json'),
+        (
+            PureWindowsPath('//?/C:/repo/config.json'),
+            str(PureWindowsPath('//?/C:/repo/config.json'))
+            .encode('unicode_escape')
+            .decode('ascii'),
+        ),
+        (
+            PureWindowsPath('//./pipe/tool'),
+            str(PureWindowsPath('//./pipe/tool')).encode('unicode_escape').decode('ascii'),
+        ),
+        (PurePosixPath(r'/repo/literal\name.json'), r'/repo/literal\\name.json'),
+    ],
+)
+def test_render_report_normalizes_only_path_fields(path: PurePath, expected: str) -> None:
+    source = ConfigSource(cast('Path', path), SourceKind.USER, exists=True)
+    report = DoctorReport(
+        host='claude',
+        executable=cast('Path', path),
+        version='0.0.0',
+        platform=PlatformReport('CPython', 'posix', None, ()),
+        sources=(source,),
+        registrations=(_registration(source, r'child --file C:\repo\file.py'),),
+        findings=(Finding(FindingSeverity.INFO, 'opaque', r'raw C:\repo\file.py'),),
+        limitations=(),
+    )
+    stream = io.StringIO()
+    _render_report(report, stream)
+    output = stream.getvalue()
+    assert f'wrapper: {expected}\n' in output
+    assert f'- [user] {expected}: exists\n' in output
+    assert f'- source: {expected}\n' in output
+    assert r'  command: child --file C:\\repo\\file.py' + '\n' in output
+    assert r'- [info] opaque: raw C:\\repo\\file.py' + '\n' in output
+    assert source.path is path
